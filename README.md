@@ -1,83 +1,68 @@
-# SPC Generator
+# SPC Generator (Automated Process Control)
 
-Statistical Process Control (SPC) automation tool for generating histograms and tolerance tables from inspection data.
+![Version](https://img.shields.io/badge/version-4.3.0-blue) ![Python](https://img.shields.io/badge/python-3.9%2B-green) ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 
-## Features
+**Turn messy Excel inspection data into professional Engineering capability reports in seconds.**
 
-* **Batch Processing:** Automatically processes multiple Excel inspection files.
-* **Statistical Analysis:** Calculates ±3σ tolerance limits using within-subgroup variation (c4 constants).
-* **Project Organization:** Automatically routes results into organized project folders (e.g., `output/Batch_A/`).
-* **Visual Interface:** Interactive command-line menu for file selection using `rich` and `questionary`.
-* **Excel Integration:** Outputs results with embedded charts and formatted tables.
+The SPC Generator is a local automation tool designed for Quality and Manufacturing Engineers. It processes raw inspection data from Excel, performs statistical analysis (Cp/Cpk), and generates PDF "White Paper" style reports and visual control charts without requiring manual calculations.
 
 ---
 
-## Quick Start
+## 🚀 Key Features
 
-### Installation
-
-**Option A: One-Click (Windows)**
-1. Ensure Python 3.9+ is installed.
-2. Double-click `install.bat`.
-
-**Option B: Developer Mode**
-Open a terminal in the project root and run:
-```bash
-python -m pip install -e .
-```
-
-### Usage
-
-**1. Generate an Input Template**
-Open a terminal and run:
-```bash
-spc-template
-```
-*This creates `SPC-DATA_Input_Template.xlsx`.*
-
-**2. Fill Data**
-Fill the template and save your data files with the prefix `SPC-DATA_` in your working directory (e.g., `SPC-DATA_Lot104.xlsx`).
-
-**3. Run the Analysis**
-Double-click `run.bat` (or run `spc-gen` in a terminal).
-
-* **Select Files:** Use `Spacebar` to select files, `Enter` to confirm.
-* **Name Project:** Enter a name (e.g., "Run_05").
-* **View Results:** Open the `output/Run_05/` folder to see your reports.
+* **⚡ Zero-Setup Batch Processing:** Drop 1 or 100 Excel files into the folder and process them all at once.
+* **📊 Advanced Statistics:** Automatically calculates **Cp, Cpk, Mean, and Sigma** using industry-standard within-subgroup variation (Unbiased Standard Deviation / $c_4$ constants).
+* **🚨 Automatic Anomaly Detection:** Scans data against **8 standard WECO (Western Electric) Rules** to detect instability, trends, and stratification.
+* **📑 "Audit-Ready" PDF Reports:** Generates a clean Executive Summary and individual Bell Curve histograms for every feature.
+* **📈 Visual Excel Integration:** Outputs a new Excel file with embedded control charts, color-coded pass/fail cells, and histograms.
 
 ---
 
-## Project Structure
+## 🛠️ How It Works
 
-```text
-spc-generator/
-├── output/                  # Ignored by Git (Results go here)
-├── src/spc_generator/       # Source Code (Package)
-│   ├── generator.py         # Main logic
-│   └── template.py          # Template generator
-├── docs/                    # Documentation
-│   ├── USER_GUIDE.md        # Instructions for End Users
-│   └── TESTING.md           # Developer Guide for Tests
-├── install.bat              # One-click Installer
-├── run.bat                  # One-click Launcher
-└── pyproject.toml           # Configuration & Dependencies
-```
+1.  **Input:** You fill out a simple Excel template with your measurements.
+2.  **Process:** The tool scans for tolerance limits. It intelligently detects if you entered "Absolute Limits" (e.g., `10.05`) or "Tolerances" (e.g., `0.05`) and standardizes them.
+3.  **Analyze:** It runs a full SPC scan, checking for outliers and statistical control.
+4.  **Output:** You get a folder containing your reports, organized by Project Name.
 
 ---
 
-## Development
+## 🏁 Quick Start
 
-### Running Tests
+### 1. Installation (Windows)
+No command line knowledge required.
+1.  Install [Python 3.9+](https://www.python.org/downloads/) (Make sure to check **"Add to PATH"** during install).
+2.  Download this folder.
+3.  Double-click `install.bat`. 
+    * *This creates a secure, local environment for the tool.*
 
-```bash
-# Run all tests
-pytest
+### 2. Usage
+1.  **Get a Template:** Double-click `get-template.bat` to generate a blank input file.
+2.  **Enter Data:** Fill in your measurements and save the file with the prefix `SPC-DATA_` (e.g., `SPC-DATA_Batch101.xlsx`).
+3.  **Run:** Double-click `run.bat`.
+4.  **Select & Go:** Follow the on-screen prompts to select your files and name your project.
 
-# Run with coverage report
-pytest --cov=spc_generator --cov-report=html
-```
+---
 
-## Documentation
+## 📂 Project Structure
 
-* [User Guide](docs/USER_GUIDE.md) - Instructions for non-technical users.
-* [Testing Guide](docs/TESTING.md) - Deep dive into the test fixtures.
+* `input/` - (Root) Place your `SPC-DATA_*.xlsx` files here.
+* `output/` - Results are automatically sorted here by Project Name.
+* `src/` - The core Python application logic.
+* `docs/` - Detailed documentation.
+
+---
+
+## 🛡️ Methodology
+
+The tool uses **within-subgroup standard deviation** ($\hat{\sigma}_{within}$) to estimate process capability ($C_{pk}$), which is the standard for short-run manufacturing analysis.
+
+$$\hat{\sigma} = \frac{\bar{R}}{d_2} \quad \text{or} \quad \frac{\bar{s}}{c_4}$$
+
+*Note: This tool uses the $c_4$ method for higher accuracy with varying subgroup sizes.*
+
+---
+
+## 🤝 Contributing
+
+See [docs/TESTING.md](docs/TESTING.md) for information on running the test suite (`pytest`).

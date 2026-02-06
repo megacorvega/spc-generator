@@ -1,4 +1,4 @@
-# SPC Generator (Automated Process Control)
+# SPC Generator
 
 ![Version](https://img.shields.io/badge/version-4.3.0-blue) ![Python](https://img.shields.io/badge/python-3.9%2B-green) ![License](https://img.shields.io/badge/license-MIT-lightgrey)
 

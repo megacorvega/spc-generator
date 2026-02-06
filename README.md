@@ -55,11 +55,11 @@ No command line knowledge required.
 
 ## 🛡️ Methodology
 
-The tool uses **within-subgroup standard deviation** ($\hat{\sigma}_{within}$) to estimate process capability ($C_{pk}$), which is the standard for short-run manufacturing analysis.
+The tool uses **within-subgroup standard deviation** (σ_within) to estimate process capability (Cpk), which is the standard for short-run manufacturing analysis.
 
-$$\hat{\sigma} = \frac{\bar{R}}{d_2} \quad \text{or} \quad \frac{\bar{s}}{c_4}$$
+**σ = R̄ / d₂** or   **s̄ / c₄**
 
-*Note: This tool uses the $c_4$ method for higher accuracy with varying subgroup sizes.*
+*Note: This tool uses the c₄ method for higher accuracy with varying subgroup sizes.*
 
 ---
 

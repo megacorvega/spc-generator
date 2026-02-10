@@ -3,11 +3,11 @@
  ----------------------------------------------------------------------
  Logic:
   1. SCANS for tabs starting with "SPC_"
-  2. EXTRACTS HEADER ROWS (1-7) to find Part #, Batch, Date, etc.
-  3. CALCULATES Analysis (Stats + Rules + Cpk) OR Attribute Analysis
+  2. EXTRACTS HEADER ROWS to find Part #, Batch, Date, etc.
+  3. CALCULATES Analysis (Numeric Cpk OR Attribute Pass/Fail)
   4. GENERATES PDF with SECTION BREAKS per Tab.
   
- Version: 4.4.0 (Added Pass/Fail Attribute Support)
+ Version: 4.4.1 (Fixed Attribute/Numeric Hybrid Processing)
 """
 
 # --- IMPORTS ---
@@ -47,7 +47,7 @@ from rich.tree import Tree
 console = Console()
 
 # --- CONSTANTS ---
-TOOL_VERSION = "4.4.0"
+TOOL_VERSION = "4.4.1"
 INPUT_PREFIX = "SPC_"        
 INSERT_START_ROW = 8   
 HEADER_SEARCH_ROWS = 7 
@@ -381,20 +381,28 @@ def process_single_file(filepath, output_dir):
             
             # --- FEATURE LOOP ---
             feature_cols = [c for c in df_raw.columns if "Unnamed" not in str(c)]
-            metadata_keys = [nom_idx, usl_idx, lsl_idx]
+            
+            # Create exclude list (handle cases where limit rows might be missing)
+            metadata_keys = [k for k in [nom_idx, usl_idx, lsl_idx] if k is not None]
+
             features_data = []
             
             for col in feature_cols:
                 try:
-                    # Raw data scan
+                    # 1. Capture Header Values (As Text)
+                    nom_raw = str(df_raw.loc[nom_idx, col]) if nom_idx is not None else "N/A"
+                    usl_raw = str(df_raw.loc[usl_idx, col]) if usl_idx is not None else "N/A"
+                    lsl_raw = str(df_raw.loc[lsl_idx, col]) if lsl_idx is not None else "N/A"
+
+                    # 2. Extract Data
                     raw_sample_indices = [x for x in df_raw.index if x not in metadata_keys]
                     raw_values = df_raw.loc[raw_sample_indices, col].tolist()
                     
-                    # --- AUTO-DETECT TYPE: ATTRIBUTE VS NUMERIC ---
+                    # 3. Auto-Detect Type
                     float_conversions = 0
                     valid_items = 0
                     for v in raw_values:
-                        if str(v).strip() == "": continue
+                        if str(v).strip() == "" or str(v).lower() == "nan": continue
                         valid_items += 1
                         try:
                             f = float(v)
@@ -416,7 +424,7 @@ def process_single_file(filepath, output_dir):
                         
                         for val in raw_values:
                             s_val = str(val).upper().strip()
-                            if not s_val: continue
+                            if not s_val or s_val == "NAN": continue
                             
                             # 1 = PASS, 0 = FAIL
                             if any(k in s_val for k in pass_kw):
@@ -438,7 +446,9 @@ def process_single_file(filepath, output_dir):
                             'pass_count': pass_count,
                             'fail_count': fail_count,
                             'fail_rate': fail_rate,
-                            'nominal': "N/A", 'usl': "N/A", 'lsl': "N/A"
+                            'nominal_txt': nom_raw, 
+                            'usl_txt': usl_raw, 
+                            'lsl_txt': lsl_raw
                         })
                         
                         status = "PASS" if fail_count == 0 else "FAIL"
@@ -446,12 +456,15 @@ def process_single_file(filepath, output_dir):
 
                     # --- PATH B: NUMERIC ---
                     else:
-                        nom_val = df_raw.loc[nom_idx, col]
-                        if pd.isna(nom_val) or str(nom_val).strip() == "": continue
-                        
+                        # For Numeric, we MUST have limits. 
+                        # If limits are missing, we skip Cpk but might ideally want to log it.
+                        if usl_idx is None or lsl_idx is None: 
+                            # If user didn't provide limits for a numeric column, we can't do SPC.
+                            continue
+
+                        # Clean Data
                         clean_samples = []
                         plot_split_locs = []
-                        
                         for i, (label, val) in enumerate(zip(raw_sample_indices, raw_values)):
                             is_split = (str(label).upper().strip() == "SPLIT" or str(val).upper().strip() == "SPLIT")
                             if is_split:
@@ -462,20 +475,22 @@ def process_single_file(filepath, output_dir):
                                 if not np.isnan(num): clean_samples.append(num)
                             except: pass
 
+                        # Parse Limits
+                        try:
+                            nom_val_float = float(nom_raw)
+                            raw_usl_float = float(usl_raw)
+                            raw_lsl_float = float(lsl_raw)
+                        except:
+                            # If header values aren't numbers, skip this numeric column
+                            continue
+
                         # Tolerance Logic
-                        nom_val_float = float(nom_val)
-                        # We need USL/LSL for numeric
-                        if usl_idx is None or lsl_idx is None: continue
-                        
-                        raw_usl = float(df_raw.loc[usl_idx, col])
-                        raw_lsl = float(df_raw.loc[lsl_idx, col])
+                        usl_val = raw_usl_float
+                        lsl_val = raw_lsl_float
 
-                        usl_val = raw_usl
-                        lsl_val = raw_lsl
-
-                        if raw_usl < nom_val_float:
-                             usl_val = nom_val_float + abs(raw_usl)
-                             lsl_val = nom_val_float - abs(raw_lsl)
+                        if raw_usl_float < nom_val_float:
+                             usl_val = nom_val_float + abs(raw_usl_float)
+                             lsl_val = nom_val_float - abs(raw_lsl_float)
                         
                         if usl_val == lsl_val: usl_val += 0.0001; lsl_val -= 0.0001
 
@@ -491,7 +506,9 @@ def process_single_file(filepath, output_dir):
                         })
                         pdf_summary_data.append([sheet_name, col, f"{cpk:.2f}", "PASS" if cpk >= 1.33 else "FAIL"])
 
-                except: continue
+                except Exception as e: 
+                    # console.print(f"[red]Error on col {col}: {e}[/red]")
+                    continue
             
             if not features_data: 
                 tab_log.append({'name': sheet_name, 'status': 'SKIP', 'msg': "No valid data found"})
@@ -548,26 +565,37 @@ def process_single_file(filepath, output_dir):
                 
                 else:
                     # Attribute row writing
-                    ws.cell(r, 2, "N/A").alignment = Alignment(horizontal='center')
-                    ws.cell(r, 3, "N/A").alignment = Alignment(horizontal='center')
-                    ws.cell(r, 4, "N/A").alignment = Alignment(horizontal='center')
+                    # Use the CAPTURED strings from the input file
+                    c_nom = ws.cell(r, 2, feat['nominal_txt'])
+                    c_lsl = ws.cell(r, 3, feat['lsl_txt'])
+                    c_usl = ws.cell(r, 4, feat['usl_txt'])
+                    
+                    for c in [c_nom, c_lsl, c_usl]:
+                        c.alignment = Alignment(horizontal='center')
+                        c.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
                     
                     # Col 5: Mean -> Failure Rate
                     c_rate = ws.cell(r, 5, f"{feat['fail_rate']:.1f}% Fail")
                     c_rate.alignment = Alignment(horizontal='center')
-                    
-                    ws.cell(r, 6, "N/A").alignment = Alignment(horizontal='center') # Sigma
+                    c_rate.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
+
+                    # Col 6: Sigma (N/A)
+                    c_sig = ws.cell(r, 6, "N/A")
+                    c_sig.alignment = Alignment(horizontal='center')
+                    c_sig.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
                     
                     # Col 7: Status
                     status_text = "PASS" if feat['fail_count'] == 0 else "FAIL"
                     c_stat = ws.cell(r, 7, status_text)
                     c_stat.alignment = Alignment(horizontal='center')
+                    c_stat.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
                     c_stat.font = Font(bold=True)
                     if feat['fail_count'] > 0: c_stat.fill, c_stat.font = f_fail, font_f
                     else: c_stat.fill, c_stat.font = f_pass, font_p
 
                     # Col 8: Notes
-                    ws.cell(r, 8, f"Count: {feat['pass_count']} Pass / {feat['fail_count']} Fail")
+                    c_note = ws.cell(r, 8, f"Count: {feat['pass_count']} Pass / {feat['fail_count']} Fail")
+                    c_note.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
 
                 r += 1
 

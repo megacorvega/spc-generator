@@ -7,7 +7,7 @@
   3. CALCULATES Analysis (Stats + Rules + Cpk)
   4. GENERATES PDF with SECTION BREAKS per Tab.
   
- Version: 4.3.0 (Fixed Tolerance Logic)
+ Version: 4.3.1 (Fixed Flexible Header Logic)
 """
 
 # --- IMPORTS ---
@@ -48,7 +48,7 @@ from rich import box
 console = Console()
 
 # --- CONSTANTS ---
-TOOL_VERSION = "4.3.0"
+TOOL_VERSION = "4.3.1"
 INPUT_PREFIX = "SPC_"        
 INSERT_START_ROW = 8   
 HEADER_SEARCH_ROWS = 7 # How many rows to scan for Part/Batch info
@@ -367,6 +367,18 @@ def create_bell_curve_plot(data, usl, lsl, nominal, mean, sigma, feature_name, o
     return save_path
 
 # --- PROCESSOR ---
+def get_row_index_fuzzy(df, keywords):
+    """
+    Finds the index label that contains any of the keywords (case-insensitive).
+    Returns the first match, or None.
+    """
+    for idx_val in df.index:
+        str_val = str(idx_val).upper()
+        for k in keywords:
+            if k.upper() in str_val:
+                return idx_val
+    return None
+
 def process_single_file(filepath, output_dir):
     filename = os.path.basename(filepath)
     wait_for_file_access(filepath)
@@ -428,23 +440,38 @@ def process_single_file(filepath, output_dir):
             if df_raw.shape[1] > 0 and df_raw.columns[0] not in df_raw.index.names:
                 df_raw.set_index(df_raw.columns[0], inplace=True)
 
+            # --- DYNAMIC KEY IDENTIFICATION ---
+            nom_idx = get_row_index_fuzzy(df_raw, ["Nominal", "Nom", "Target"])
+            usl_idx = get_row_index_fuzzy(df_raw, ["USL", "Upper", "High"])
+            lsl_idx = get_row_index_fuzzy(df_raw, ["LSL", "Lower", "Low"])
+
             # --- CHECK 3: "NOMINAL" ROW EXISTENCE ---
-            if "Nominal" not in df_raw.index:
+            if nom_idx is None:
                 tab_log.append({
                     'name': sheet_name, 
                     'status': 'SKIP', 
-                    'msg': "Missing row labeled 'Nominal' in Column A"
+                    'msg': "Could not find 'Nominal' row in Column A"
                 })
                 continue
+            
+            if usl_idx is None or lsl_idx is None:
+                 tab_log.append({
+                    'name': sheet_name, 
+                    'status': 'SKIP', 
+                    'msg': "Could not find USL/LSL rows in Column A"
+                })
+                 continue
 
             feature_cols = [c for c in df_raw.columns if "Unnamed" not in str(c)]
-            metadata_keys = ['Nominal', 'USL', 'LSL']
+            # We must exclude the specification rows from the samples
+            metadata_keys = [nom_idx, usl_idx, lsl_idx]
             
             features_data = []
             
             for col in feature_cols:
                 try:
-                    nom_val = df_raw.loc['Nominal', col]
+                    # Retrieve Nominal using the dynamically found index
+                    nom_val = df_raw.loc[nom_idx, col]
                     if pd.isna(nom_val) or str(nom_val).strip() == "": continue
                     
                     sample_idxs = [x for x in df_raw.index if x not in metadata_keys]
@@ -466,8 +493,9 @@ def process_single_file(filepath, output_dir):
                     
                     # --- REVISED LOGIC: TOLERANCE VS LIMIT ---
                     nom_val_float = float(nom_val)
-                    raw_usl = float(df_raw.loc['USL', col])
-                    raw_lsl = float(df_raw.loc['LSL', col])
+                    # Retrieve Limits using the dynamically found indices
+                    raw_usl = float(df_raw.loc[usl_idx, col])
+                    raw_lsl = float(df_raw.loc[lsl_idx, col])
 
                     # Detection Logic:
                     # If USL Input is strictly less than Nominal, we assume it is a TOLERANCE.

@@ -7,7 +7,7 @@
   3. CALCULATES Analysis (Stats + Rules + Cpk)
   4. GENERATES PDF with SECTION BREAKS per Tab.
   
- Version: 4.3.1 (Flexible Labeling Update)
+ Version: 4.3.0 (Fixed Tolerance Logic)
 """
 
 # --- IMPORTS ---
@@ -48,7 +48,7 @@ from rich import box
 console = Console()
 
 # --- CONSTANTS ---
-TOOL_VERSION = "4.3.1"
+TOOL_VERSION = "4.3.0"
 INPUT_PREFIX = "SPC_"        
 INSERT_START_ROW = 8   
 HEADER_SEARCH_ROWS = 7 # How many rows to scan for Part/Batch info
@@ -380,447 +380,6 @@ def process_single_file(filepath, output_dir):
     output_path = get_unique_filepath(str(target_path))
     pdf_path = get_unique_filepath(str(output_dir / pdf_filename))
     
-    tab_log = [] 
-
-    try:
-        wb_output = load_workbook(filepath)
-    except Exception as e:
-        return {"critical_error": f"Could not open Excel file: {str(e)}", "logs": []}
-
-    xls = pd.ExcelFile(filepath)
-    all_sheet_names = xls.sheet_names
-    
-    processed_tabs = []
-    temp_files = [] 
-    
-    pdf = WhitePaperPDF(filename)
-    pdf.add_page()
-    pdf.chapter_title(f"Executive Summary")
-    pdf.body_text(f"File: {filename}")
-    pdf.body_text(f"Processed on: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    pdf.ln(5)
-    
-    pdf_summary_data = []
-
-    for sheet_name in all_sheet_names:
-        if not sheet_name.startswith(INPUT_PREFIX):
-            tab_log.append({'name': sheet_name, 'status': 'SKIP', 'msg': f"Tab name must start with '{INPUT_PREFIX}'"})
-            continue
-
-        try:
-            ws_meta = wb_output[sheet_name]
-            metadata = extract_sheet_metadata(ws_meta)
-            
-            try:
-                df_raw = pd.read_excel(filepath, sheet_name=sheet_name, header=0, skiprows=7)
-            except Exception as e:
-                tab_log.append({'name': sheet_name, 'status': 'ERR', 'msg': f"Pandas Read Error: {str(e)}"})
-                continue
-
-            if df_raw.shape[1] > 0 and df_raw.columns[0] not in df_raw.index.names:
-                df_raw.set_index(df_raw.columns[0], inplace=True)
-
-            nom_idx = get_row_index_fuzzy(df_raw, ["Nominal", "Nom", "Target"])
-            usl_idx = get_row_index_fuzzy(df_raw, ["USL", "Upper", "High"])
-            lsl_idx = get_row_index_fuzzy(df_raw, ["LSL", "Lower", "Low"])
-
-            if nom_idx is None:
-                tab_log.append({'name': sheet_name, 'status': 'SKIP', 'msg': "Could not find 'Nominal' row"})
-                continue
-            
-            # --- FEATURE LOOP ---
-            feature_cols = [c for c in df_raw.columns if "Unnamed" not in str(c)]
-            
-            # Create exclude list (handle cases where limit rows might be missing)
-            metadata_keys = [k for k in [nom_idx, usl_idx, lsl_idx] if k is not None]
-
-            features_data = []
-            
-            for col in feature_cols:
-                try:
-                    # 1. Capture Header Values (As Text)
-                    nom_raw = str(df_raw.loc[nom_idx, col]) if nom_idx is not None else "N/A"
-                    usl_raw = str(df_raw.loc[usl_idx, col]) if usl_idx is not None else "N/A"
-                    lsl_raw = str(df_raw.loc[lsl_idx, col]) if lsl_idx is not None else "N/A"
-
-                    # 2. Extract Data
-                    raw_sample_indices = [x for x in df_raw.index if x not in metadata_keys]
-                    raw_values = df_raw.loc[raw_sample_indices, col].tolist()
-                    
-                    # 3. Auto-Detect Type
-                    float_conversions = 0
-                    valid_items = 0
-                    for v in raw_values:
-                        if str(v).strip() == "" or str(v).lower() == "nan": continue
-                        valid_items += 1
-                        try:
-                            f = float(v)
-                            if not np.isnan(f): float_conversions += 1
-                        except: pass
-                    
-                    is_attribute = False
-                    if valid_items > 0 and (float_conversions / valid_items) < 0.5:
-                        is_attribute = True
-
-                    # --- PATH A: ATTRIBUTE (PASS/FAIL) ---
-                    if is_attribute:
-                        pass_kw = ["PASS", "OK", "GOOD", "ACCEPT", "ACC"]
-                        fail_kw = ["FAIL", "NOK", "BAD", "REJECT", "F"]
-                        
-                        clean_samples = []
-                        pass_count = 0
-                        fail_count = 0
-                        
-                        for val in raw_values:
-                            s_val = str(val).upper().strip()
-                            if not s_val or s_val == "NAN": continue
-                            
-                            # 1 = PASS, 0 = FAIL
-                            if any(k in s_val for k in pass_kw):
-                                clean_samples.append(1)
-                                pass_count += 1
-                            elif any(k in s_val for k in fail_kw):
-                                clean_samples.append(0)
-                                fail_count += 1
-                        
-                        if not clean_samples: continue
-
-                        total = pass_count + fail_count
-                        fail_rate = (fail_count / total) * 100 if total > 0 else 0
-                        
-                        features_data.append({
-                            'type': 'attribute',
-                            'name': col,
-                            'data': np.array(clean_samples),
-                            'pass_count': pass_count,
-                            'fail_count': fail_count,
-                            'fail_rate': fail_rate,
-                            'nominal_txt': nom_raw, 
-                            'usl_txt': usl_raw, 
-                            'lsl_txt': lsl_raw
-                        })
-                        
-                        status = "PASS" if fail_count == 0 else "FAIL"
-                        pdf_summary_data.append([sheet_name, col, "N/A", status])
-
-                    # --- PATH B: NUMERIC ---
-                    else:
-                        # For Numeric, we MUST have limits. 
-                        # If limits are missing, we skip Cpk but might ideally want to log it.
-                        if usl_idx is None or lsl_idx is None: 
-                            # If user didn't provide limits for a numeric column, we can't do SPC.
-                            continue
-
-                        # Clean Data
-                        clean_samples = []
-                        plot_split_locs = []
-                        for i, (label, val) in enumerate(zip(raw_sample_indices, raw_values)):
-                            is_split = (str(label).upper().strip() == "SPLIT" or str(val).upper().strip() == "SPLIT")
-                            if is_split:
-                                plot_split_locs.append(len(clean_samples))
-                                continue
-                            try:
-                                num = float(val)
-                                if not np.isnan(num): clean_samples.append(num)
-                            except: pass
-
-                        # Parse Limits
-                        try:
-                            nom_val_float = float(nom_raw)
-                            raw_usl_float = float(usl_raw)
-                            raw_lsl_float = float(lsl_raw)
-                        except:
-                            # If header values aren't numbers, skip this numeric column
-                            continue
-
-                        # Tolerance Logic
-                        usl_val = raw_usl_float
-                        lsl_val = raw_lsl_float
-
-                        if raw_usl_float < nom_val_float:
-                             usl_val = nom_val_float + abs(raw_usl_float)
-                             lsl_val = nom_val_float - abs(raw_lsl_float)
-                        
-                        if usl_val == lsl_val: usl_val += 0.0001; lsl_val -= 0.0001
-
-                        cp, cpk, mean_val, sigma_val = calculate_cpk(np.array(clean_samples), usl_val, lsl_val)
-                        
-                        features_data.append({
-                            'type': 'numeric',
-                            'name': col, 'nominal': nom_val_float,
-                            'usl': usl_val, 'lsl': lsl_val,
-                            'data': np.array(clean_samples),
-                            'split_locs': plot_split_locs,
-                            'cp': cp, 'cpk': cpk, 'mean': mean_val, 'sigma': sigma_val
-                        })
-                        pdf_summary_data.append([sheet_name, col, f"{cpk:.2f}", "PASS" if cpk >= 1.33 else "FAIL"])
-
-                except Exception as e: 
-                    # console.print(f"[red]Error on col {col}: {e}[/red]")
-                    continue
-            
-            if not features_data: 
-                tab_log.append({'name': sheet_name, 'status': 'SKIP', 'msg': "No valid data found"})
-                continue
-
-            # --- EXCEL OUTPUT ---
-            ws = wb_output[sheet_name]
-            processed_tabs.append(sheet_name)
-            safe_name = sanitize_filename(sheet_name)[:20]
-
-            ws['A1'] = "SPC ANALYSIS RESULTS"
-            ws['A1'].fill = PatternFill(start_color=COLOR_PURPLE_DARK, end_color=COLOR_PURPLE_DARK, fill_type="solid")
-
-            num_features = len(features_data)
-            table_rows_needed = 2 + num_features + 1
-            chart_rows_needed = num_features 
-            total_insert_count = table_rows_needed + chart_rows_needed + 2
-
-            shift_existing_images(ws, INSERT_START_ROW, total_insert_count)
-            ws.insert_rows(INSERT_START_ROW, amount=total_insert_count)
-            write_rule_legend(ws, 1)
-
-            r = INSERT_START_ROW
-            ws.cell(r,1,"ANALYSIS SUMMARY").font = Font(bold=True, size=14, color="FFFFFF")
-            ws.cell(r,1).fill = PatternFill(start_color=COLOR_PURPLE_DARK, end_color=COLOR_PURPLE_DARK, fill_type="solid")
-            r += 1
-            
-            # --- MODIFIED HEADERS ---
-            headers = ["Feature", "Nominal", "LSL", "USL", "Dev +", "Dev -", "Mean / Rate", "Sigma", "Status", "Notes"]
-            for i, h in enumerate(headers, 1): style_header_cell(ws.cell(r, i, h))
-            
-            f_pass, font_p = PatternFill(start_color="C6EFCE", fill_type="solid"), Font(color="006100", bold=True)
-            f_warn, font_w = PatternFill(start_color="FFEB9C", fill_type="solid"), Font(color="9C6500", bold=True)
-            f_fail, font_f = PatternFill(start_color="FFC7CE", fill_type="solid"), Font(color="9C0006", bold=True)
-            
-            r += 1 
-            for feat in features_data:
-                # Common Cells
-                ws.cell(r, 1, str(feat['name'])).border = Border(bottom=Side(style='thin'))
-                
-                if feat['type'] == 'numeric':
-                    # Numeric row writing
-                    mean = feat['mean']
-                    status, is_unstable, _ = check_spc_rules_full_scan(feat['data'], mean, feat['sigma'])
-                    
-                    # --- NEW DEVIATION CALCULATION LOGIC ---
-                    nom = feat['nominal']
-                    usl_orig = feat['usl']
-                    lsl_orig = feat['lsl']
-                    
-                    if len(feat['data']) > 0:
-                        meas_max = np.max(feat['data'])
-                        meas_min = np.min(feat['data'])
-                        
-                        # Actual deviation from nominal
-                        dev_u_act = meas_max - nom
-                        dev_l_act = meas_min - nom
-                        
-                        # Original tolerance spread from nominal
-                        tol_u_orig = usl_orig - nom
-                        tol_l_orig = lsl_orig - nom
-                        
-                        # Use the larger of the two (Original Spec vs Actual Deviation)
-                        rec_u = max(tol_u_orig, dev_u_act)
-                        rec_l = min(tol_l_orig, dev_l_act)
-                    else:
-                        rec_u = usl_orig - nom
-                        rec_l = lsl_orig - nom
-                    # ---------------------------------------
-
-                    row_vals = [
-                        feat['nominal'], 
-                        feat['lsl'], 
-                        feat['usl'], 
-                        rec_u,          # New Col 5
-                        rec_l,          # New Col 6
-                        mean, 
-                        feat['sigma'], 
-                        status, 
-                        f"Cpk: {feat['cpk']:.2f}"
-                    ]
-                    
-                    for c_idx, val in enumerate(row_vals, 2):
-                        cell = ws.cell(r, c_idx, val)
-                        # Apply numeric style to Columns 2-8
-                        style_data_cell(cell, is_numeric=(c_idx in range(2, 9)))
-                        
-                        # Special formatting for Deviation columns to show "+0.000"
-                        if c_idx in [5, 6]:
-                            cell.number_format = '+0.0000;-0.0000;0.0000'
-
-                        # Coloring for Status (Now at Index 9)
-                        if c_idx == 9: 
-                            if is_unstable: cell.fill, cell.font = f_fail, font_f
-                            elif "LIMITED" in status: cell.fill, cell.font = f_warn, font_w
-                            else: cell.fill, cell.font = f_pass, font_p
-                
-                else:
-                    # Attribute row writing
-                    c_nom = ws.cell(r, 2, feat['nominal_txt'])
-                    c_lsl = ws.cell(r, 3, feat['lsl_txt'])
-                    c_usl = ws.cell(r, 4, feat['usl_txt'])
-                    
-                    for c in [c_nom, c_lsl, c_usl]:
-                        c.alignment = Alignment(horizontal='center')
-                        c.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-                    
-                    # New Deviation Columns (N/A for Attributes)
-                    c_dev_p = ws.cell(r, 5, "N/A")
-                    style_data_cell(c_dev_p)
-                    c_dev_m = ws.cell(r, 6, "N/A")
-                    style_data_cell(c_dev_m)
-
-                    # Col 7: Mean -> Failure Rate
-                    c_rate = ws.cell(r, 7, f"{feat['fail_rate']:.1f}% Fail")
-                    c_rate.alignment = Alignment(horizontal='center')
-                    c_rate.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-
-                    # Col 8: Sigma (N/A)
-                    c_sig = ws.cell(r, 8, "N/A")
-                    c_sig.alignment = Alignment(horizontal='center')
-                    c_sig.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-                    
-                    # Col 9: Status
-                    status_text = "PASS" if feat['fail_count'] == 0 else "FAIL"
-                    c_stat = ws.cell(r, 9, status_text)
-                    c_stat.alignment = Alignment(horizontal='center')
-                    c_stat.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-                    c_stat.font = Font(bold=True)
-                    if feat['fail_count'] > 0: c_stat.fill, c_stat.font = f_fail, font_f
-                    else: c_stat.fill, c_stat.font = f_pass, font_p
-
-                    # Col 10: Notes
-                    c_note = ws.cell(r, 10, f"Count: {feat['pass_count']} Pass / {feat['fail_count']} Fail")
-                    c_note.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-
-                r += 1
-
-            r += 1 
-            img_start_row = r
-            
-            pdf.add_section_header(sheet_name, metadata)
-
-            for i, feat in enumerate(features_data):
-                name = str(feat['name'])
-                unique_prefix = f"{safe_name}_{i}"
-                
-                # --- CHART GENERATION ---
-                img_path = ""
-                
-                if feat['type'] == 'numeric':
-                    # Numeric PDF
-                    pdf.add_page()
-                    pdf.chapter_title(f"Feature: {name}", subtitle=f"Sheet: {sheet_name}")
-                    bell_path = create_bell_curve_plot(feat['data'], feat['usl'], feat['lsl'], feat['nominal'], 
-                                              feat['mean'], feat['sigma'], name, output_dir, f"BELL_{unique_prefix}")
-                    temp_files.append(bell_path)
-                    pdf.image(bell_path, x=15, w=170)
-                    pdf.ln(5)
-                    pdf.chapter_title("Statistical Interpretation")
-                    status_text = "CAPABLE" if feat['cpk'] >= 1.33 else "NOT CAPABLE"
-                    pdf.body_text(f"Process is {status_text} (Cpk {feat['cpk']:.2f}).")
-                    pdf.ln(5)
-                    metrics = [("Cpk", f"{feat['cpk']:.2f}"), ("Mean", f"{feat['mean']:.4f}"), ("Sigma", f"{feat['sigma']:.4f}")]
-                    pdf.add_stat_table(metrics)
-
-                    # Numeric Excel Chart
-                    mean = feat['mean']
-                    _, is_unstable, highlight_indices = check_spc_rules_full_scan(feat['data'], mean, feat['sigma'])
-                    fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
-                    x_axis = np.arange(1, len(feat['data']) + 1)
-                    
-                    ax.axhline(mean, color='green')
-                    ax.axhline(feat['usl'], color='red')
-                    ax.axhline(feat['lsl'], color='red')
-                    ax.plot(x_axis, feat['data'], marker='o', color='black', lw=1, ms=4)
-                    
-                    if is_unstable:
-                        ax.plot(x_axis[highlight_indices], feat['data'][highlight_indices], 'o', color='red', ms=10, mfc='none', mew=2)
-
-                    ax.set_title(f"{name} (Numeric)", fontweight='bold')
-                    img_path = os.path.join(output_dir, f"TEMP_CHART_{unique_prefix}.png")
-                    plt.savefig(img_path, bbox_inches='tight')
-                    plt.close(fig)
-
-                else:
-                    # Attribute PDF
-                    pdf.add_page()
-                    pdf.chapter_title(f"Attribute: {name}", subtitle=f"Sheet: {sheet_name}")
-                    bar_path = create_attribute_bar_plot(feat['pass_count'], feat['fail_count'], name, output_dir, f"BAR_{unique_prefix}")
-                    temp_files.append(bar_path)
-                    pdf.image(bar_path, x=15, w=170)
-                    pdf.ln(5)
-                    pdf.chapter_title("Attribute Summary")
-                    pdf.body_text(f"Failure Rate: {feat['fail_rate']:.1f}%")
-                    pdf.body_text(f"Total Samples: {len(feat['data'])}")
-                    pdf.ln(5)
-                    metrics = [("Pass Count", str(feat['pass_count'])), ("Fail Count", str(feat['fail_count'])), ("Fail Rate", f"{feat['fail_rate']:.1f}%")]
-                    pdf.add_stat_table(metrics)
-
-                    # Attribute Excel Chart (Step Chart)
-                    fig, ax = plt.subplots(figsize=(10, 4), dpi=100)
-                    x_axis = np.arange(1, len(feat['data']) + 1)
-                    
-                    # Plot 1s and 0s
-                    ax.step(x_axis, feat['data'], where='mid', color='blue', lw=2)
-                    ax.set_yticks([0, 1])
-                    ax.set_yticklabels(['FAIL', 'PASS'])
-                    ax.set_ylim(-0.2, 1.2)
-                    
-                    # Highlight Fails
-                    fail_indices = np.where(feat['data'] == 0)[0]
-                    if len(fail_indices) > 0:
-                        ax.plot(x_axis[fail_indices], feat['data'][fail_indices], 'x', color='red', ms=10, mew=3)
-
-                    ax.set_title(f"{name} (Attribute)", fontweight='bold')
-                    img_path = os.path.join(output_dir, f"TEMP_CHART_{unique_prefix}.png")
-                    plt.savefig(img_path, bbox_inches='tight')
-                    plt.close(fig)
-
-                temp_files.append(img_path)
-                img = XLImage(img_path)
-                img.width, img.height = 600, 300
-                ws.add_image(img, f"B{img_start_row}")
-                ws.row_dimensions[img_start_row].height = 225
-                ws.cell(img_start_row, 1, name).font = Font(bold=True, size=12)
-                img_start_row += 1
-
-            # Styling original data rows (Gray out headers)
-            grey_f = PatternFill(start_color="E7E6E6", fill_type="solid")
-            for scan_row in range(total_insert_count + 1, ws.max_row + 1):
-                val = str(ws.cell(scan_row, 1).value).strip()
-                if any(k in val for k in ["Nominal", "USL", "LSL", "Target", "Upper", "Lower"]):
-                    for col_idx in range(1, ws.max_column + 1):
-                        ws.cell(scan_row, col_idx).fill = grey_f
-            
-            tab_log.append({'name': sheet_name, 'status': 'OK', 'msg': f"Processed {len(features_data)} features"})
-
-        except Exception as e:
-            tab_log.append({'name': sheet_name, 'status': 'ERR', 'msg': str(e)})
-            continue
-
-    if processed_tabs:
-        wb_output.active = 0
-        wb_output.save(output_path)
-        pdf.output(pdf_path)
-        for f in temp_files:
-            try: os.remove(f)
-            except: pass
-    
-    return {"processed": processed_tabs, "logs": tab_log, "ignored": []}
-    filename = os.path.basename(filepath)
-    wait_for_file_access(filepath)
-    
-    date_str = datetime.now().strftime("%Y%m%d")
-    suffix = filename[9:] if filename.startswith("SPC-DATA_") else filename
-    target_filename = f"{date_str}_SPC-RESULTS_{suffix}"
-    pdf_filename = f"{date_str}_REPORT_{suffix}.pdf"
-    
-    target_path = output_dir / target_filename
-    output_path = get_unique_filepath(str(target_path))
-    pdf_path = get_unique_filepath(str(output_dir / pdf_filename))
-    
     # TRACKING LOGS
     tab_log = [] # Stores: {'name': str, 'status': 'OK'|'SKIP'|'ERR', 'msg': str}
 
@@ -869,37 +428,26 @@ def process_single_file(filepath, output_dir):
             if df_raw.shape[1] > 0 and df_raw.columns[0] not in df_raw.index.names:
                 df_raw.set_index(df_raw.columns[0], inplace=True)
 
-            # --- CHECK 3: METADATA ROW EXISTENCE (POSITIONAL) ---
-            # We assume the first 3 rows are Nominal, USL, LSL (regardless of name)
-            if df_raw.shape[0] < 3:
+            # --- CHECK 3: "NOMINAL" ROW EXISTENCE ---
+            if "Nominal" not in df_raw.index:
                 tab_log.append({
                     'name': sheet_name, 
                     'status': 'SKIP', 
-                    'msg': "Insufficient data rows (Need at least 3 rows for Nominal/USL/LSL)"
+                    'msg': "Missing row labeled 'Nominal' in Column A"
                 })
                 continue
-            
-            # Dynamically identify the metadata labels using Position
-            meta_nominal_lbl = df_raw.index[0]
-            meta_usl_lbl = df_raw.index[1]
-            meta_lsl_lbl = df_raw.index[2]
-            
-            metadata_keys = [meta_nominal_lbl, meta_usl_lbl, meta_lsl_lbl]
 
             feature_cols = [c for c in df_raw.columns if "Unnamed" not in str(c)]
+            metadata_keys = ['Nominal', 'USL', 'LSL']
             
             features_data = []
             
             for col in feature_cols:
                 try:
-                    # Use Positional Lookup
-                    nom_val = df_raw.iloc[0][col]
-                    
+                    nom_val = df_raw.loc['Nominal', col]
                     if pd.isna(nom_val) or str(nom_val).strip() == "": continue
                     
-                    # Exclude the keys we found dynamically
                     sample_idxs = [x for x in df_raw.index if x not in metadata_keys]
-                    
                     subset_indices = df_raw.loc[sample_idxs].index.tolist()
                     subset_values = df_raw.loc[sample_idxs, col].tolist()
                     
@@ -918,9 +466,8 @@ def process_single_file(filepath, output_dir):
                     
                     # --- REVISED LOGIC: TOLERANCE VS LIMIT ---
                     nom_val_float = float(nom_val)
-                    # Use Positional Lookup (Row 1=USL, Row 2=LSL)
-                    raw_usl = float(df_raw.iloc[1][col])
-                    raw_lsl = float(df_raw.iloc[2][col])
+                    raw_usl = float(df_raw.loc['USL', col])
+                    raw_lsl = float(df_raw.loc['LSL', col])
 
                     # Detection Logic:
                     # If USL Input is strictly less than Nominal, we assume it is a TOLERANCE.
@@ -957,7 +504,7 @@ def process_single_file(filepath, output_dir):
                 tab_log.append({
                     'name': sheet_name, 
                     'status': 'SKIP', 
-                    'msg': "No valid columns found (Check USL/LSL/Nominal values)"
+                    'msg': "No valid columns found (Check USL/LSL/Nominal)"
                 })
                 continue
 
@@ -1140,12 +687,8 @@ def process_single_file(filepath, output_dir):
 
             # Styling original data rows
             grey_f, thin_b = PatternFill(start_color="E7E6E6", fill_type="solid"), Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-            
-            # --- UPDATED STYLING LOOP FOR FLEXIBLE LABELS ---
             for scan_row in range(total_insert_count + 1, ws.max_row + 1):
-                val = str(ws.cell(scan_row, 1).value).strip()
-                # Check against the actual labels we found, not just "Nominal/USL/LSL"
-                if val in [str(k).strip() for k in metadata_keys]:
+                if str(ws.cell(scan_row, 1).value).strip() in ["Nominal", "USL", "LSL"]:
                     for col_idx in range(1, ws.max_column + 1):
                         c = ws.cell(scan_row, col_idx)
                         c.fill, c.border = grey_f, thin_b
@@ -1238,11 +781,10 @@ def main():
             "Select Input Files (Space to select, Enter to confirm):",
             choices=sorted([os.path.basename(f) for f in files]),
             qmark="▶"
-        )
-        # Fix for some questionary versions returning None on cancel
-        result = selected_checkboxes.ask()
-        if not result: return
-        files_to_process = [f for f in files if os.path.basename(f) in result]
+        ).ask()
+        
+        if not selected_checkboxes: return
+        files_to_process = [f for f in files if os.path.basename(f) in selected_checkboxes]
         
     else:
         files_to_process = [f for f in files if os.path.basename(f) == selected_action]

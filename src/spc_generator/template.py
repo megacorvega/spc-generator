@@ -24,7 +24,14 @@ def main():
     full_path = os.path.join(script_dir, OUTPUT_FILENAME)
 
     # --- DEFINE TRANSPOSED DATA STRUCTURE ---
-    row_labels = ["Nominal", "USL or Upper Tol.", "LSL or Lower Tol."]
+    # Updated to include specific Tolerance rows
+    row_labels = [
+        "Nominal", 
+        "USL", 
+        "LSL", 
+        "Upper Tolerance (+)", 
+        "Lower Tolerance (-)"
+    ]
     sample_labels = [f"Sample_{i}" for i in range(1, NUM_SAMPLE_ROWS + 1)]
     row_labels.extend(sample_labels)
 
@@ -69,7 +76,7 @@ def main():
             row_num = DATA_TABLE_START_ROW + 1 + row_offset
             
             # Check if this is a spec row that needs styling
-            is_spec_row = label in ["Nominal", "USL", "LSL"]
+            is_spec_row = any(x in label for x in ["Nominal", "USL", "LSL", "Tolerance"])
             
             # Label Column
             label_cell = ws.cell(row=row_num, column=1, value=label)
@@ -80,8 +87,9 @@ def main():
                 label_cell.fill = GREY_FILL
                 label_cell.border = THIN_BORDER
                 # specific text colors
-                if label == "Nominal": label_cell.font = Font(bold=True, color="000000") # Black
-                if label in ["USL", "LSL"]: label_cell.font = Font(bold=True, color="C0504D") # Red
+                if "Nominal" in label: label_cell.font = Font(bold=True, color="000000") # Black
+                elif "USL" in label or "LSL" in label: label_cell.font = Font(bold=True, color="C0504D") # Red
+                elif "Tolerance" in label: label_cell.font = Font(bold=True, color="0000FF") # Blue
 
             # Empty Data Cells
             for col_idx in range(2, 2 + len(example_features)):

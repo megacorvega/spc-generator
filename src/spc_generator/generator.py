@@ -7,7 +7,7 @@
   3. CALCULATES Analysis (Stats + Rules + Cpk)
   4. GENERATES PDF with SECTION BREAKS per Tab.
   
- Version: 4.3.0 (Fixed Tolerance Logic)
+ Version: 4.7.0 (Helpful Error Handling for Visuals)
 """
 
 # --- IMPORTS ---
@@ -48,7 +48,7 @@ from rich import box
 console = Console()
 
 # --- CONSTANTS ---
-TOOL_VERSION = "4.3.0"
+TOOL_VERSION = "4.7.0"
 INPUT_PREFIX = "SPC_"        
 INSERT_START_ROW = 8   
 HEADER_SEARCH_ROWS = 7 # How many rows to scan for Part/Batch info
@@ -243,9 +243,9 @@ def write_rule_legend(ws, start_row):
         ("Alternating", "14 consecutive points alternating up/down")
     ]
     
-    col_start = 10 # Column J
-    ws.column_dimensions['J'].width = 15
-    ws.column_dimensions['K'].width = 55
+    col_start = 12 # Column L
+    ws.column_dimensions['L'].width = 15
+    ws.column_dimensions['M'].width = 55
     
     head_r = ws.cell(start_row, col_start, "RULE REFERENCE")
     head_r.font = Font(bold=True, size=14, color="FFFFFF")
@@ -334,7 +334,22 @@ def create_summary_image(data_array, title, output_folder, index, prefix, usl_va
     return save_path
 
 # --- PLOTTING 2: BELL CURVES (For PDF) ---
-def create_bell_curve_plot(data, usl, lsl, nominal, mean, sigma, feature_name, output_dir, prefix):
+def create_bell_curve_plot(data, usl, lsl, nominal, mean, sigma, feature_name, sheet_name, output_dir, prefix):
+    # Check for insufficient variation or data (Prevents Divide by Zero error)
+    if sigma <= 1e-9:
+        console.print(f"[{sheet_name}] [{feature_name}] - Cannot create visual, not enough data or no variation.", style="bold yellow")
+        
+        # Create placeholder
+        plt.figure(figsize=(10, 6))
+        plt.text(0.5, 0.5, "Cannot generate Bell Curve:\nInsufficient Variation or Data", 
+                 horizontalalignment='center', verticalalignment='center', transform=plt.gca().transAxes, fontsize=14)
+        plt.title(f'Capability Analysis: {feature_name}', fontsize=12, fontweight='bold')
+        filename = f"TEMP_BELL_{prefix}_{sanitize_filename(feature_name)}.png"
+        save_path = os.path.join(output_dir, filename)
+        plt.savefig(save_path, bbox_inches='tight', dpi=100)
+        plt.close()
+        return save_path
+
     plt.figure(figsize=(10, 6))
     
     # Generate X axis focused on the data/tolerance
@@ -428,23 +443,48 @@ def process_single_file(filepath, output_dir):
             if df_raw.shape[1] > 0 and df_raw.columns[0] not in df_raw.index.names:
                 df_raw.set_index(df_raw.columns[0], inplace=True)
 
-            # --- CHECK 3: "NOMINAL" ROW EXISTENCE ---
-            if "Nominal" not in df_raw.index:
+            # --- CHECK 3: SMART LABEL DETECTION ---
+            # Identify which row labels are being used
+            idx_nom = next((i for i in df_raw.index if "NOMINAL" in str(i).upper() or "NOM" in str(i).upper()), None)
+            
+            # Look for explicit Limits (USL/LSL)
+            idx_usl = next((i for i in df_raw.index if "USL" in str(i).upper() or "MAX" in str(i).upper() or "UPPER LIMIT" in str(i).upper()), None)
+            idx_lsl = next((i for i in df_raw.index if "LSL" in str(i).upper() or "MIN" in str(i).upper() or "LOWER LIMIT" in str(i).upper()), None)
+            
+            # Look for Tolerances (Upper Tol/Lower Tol)
+            idx_ut = next((i for i in df_raw.index if "UPPER" in str(i).upper() and "TOL" in str(i).upper()), None)
+            idx_lt = next((i for i in df_raw.index if "LOWER" in str(i).upper() and "TOL" in str(i).upper()), None)
+
+            if not idx_nom:
                 tab_log.append({
                     'name': sheet_name, 
                     'status': 'SKIP', 
-                    'msg': "Missing row labeled 'Nominal' in Column A"
+                    'msg': "Missing row labeled 'Nominal' (or similar) in Column A"
                 })
                 continue
+            
+            # Verify we have EITHER Limits OR Tolerances
+            has_limits = (idx_usl is not None and idx_lsl is not None)
+            has_tols = (idx_ut is not None and idx_lt is not None)
+
+            if not has_limits and not has_tols:
+                 tab_log.append({
+                    'name': sheet_name, 
+                    'status': 'SKIP', 
+                    'msg': "Could not find limits. Need rows for 'USL/LSL' OR 'Upper/Lower Tolerance'"
+                })
+                 continue
 
             feature_cols = [c for c in df_raw.columns if "Unnamed" not in str(c)]
-            metadata_keys = ['Nominal', 'USL', 'LSL']
+            
+            # We must exclude ALL potential spec rows from the data samples
+            metadata_keys = [x for x in [idx_nom, idx_usl, idx_lsl, idx_ut, idx_lt] if x is not None]
             
             features_data = []
             
             for col in feature_cols:
                 try:
-                    nom_val = df_raw.loc['Nominal', col]
+                    nom_val = df_raw.loc[idx_nom, col]
                     if pd.isna(nom_val) or str(nom_val).strip() == "": continue
                     
                     sample_idxs = [x for x in df_raw.index if x not in metadata_keys]
@@ -464,24 +504,36 @@ def process_single_file(filepath, output_dir):
                             if not np.isnan(num): clean_samples.append(num)
                         except: pass
                     
-                    # --- REVISED LOGIC: TOLERANCE VS LIMIT ---
+                    # --- NEW LOGIC: DETERMINE LIMITS ---
                     nom_val_float = float(nom_val)
-                    raw_usl = float(df_raw.loc['USL', col])
-                    raw_lsl = float(df_raw.loc['LSL', col])
+                    usl_val, lsl_val = None, None
 
-                    # Detection Logic:
-                    # If USL Input is strictly less than Nominal, we assume it is a TOLERANCE.
-                    # We use ABS() on inputs to safely handle if user typed "-0.030" or "0.030"
+                    # 1. Try Absolute Limits first
+                    if has_limits:
+                        try:
+                            raw_usl = df_raw.loc[idx_usl, col]
+                            raw_lsl = df_raw.loc[idx_lsl, col]
+                            if pd.notna(raw_usl) and pd.notna(raw_lsl):
+                                usl_val = float(raw_usl)
+                                lsl_val = float(raw_lsl)
+                        except: pass
                     
-                    usl_val = raw_usl
-                    lsl_val = raw_lsl
+                    # 2. If no valid limits yet, try Tolerances
+                    if (usl_val is None or lsl_val is None) and has_tols:
+                        try:
+                            raw_ut = df_raw.loc[idx_ut, col]
+                            raw_lt = df_raw.loc[idx_lt, col]
+                            if pd.notna(raw_ut) and pd.notna(raw_lt):
+                                # Logic: USL = Nom + UpperTol, LSL = Nom - |LowerTol|
+                                usl_val = nom_val_float + abs(float(raw_ut))
+                                lsl_val = nom_val_float - abs(float(raw_lt))
+                        except: pass
+                    
+                    # 3. Final Check
+                    if usl_val is None or lsl_val is None:
+                        continue # Skip feature if no limits can be determined
 
-                    if raw_usl < nom_val_float:
-                         # Tolerance Mode detected
-                         usl_val = nom_val_float + abs(raw_usl)
-                         lsl_val = nom_val_float - abs(raw_lsl)
-                    
-                    # Fallback/Safety: If Limits end up identical (e.g. 0 tol), nudge them slightly to prevent DivByZero errors later
+                    # Fallback/Safety: If Limits end up identical
                     if usl_val == lsl_val:
                         usl_val += 0.0001
                         lsl_val -= 0.0001
@@ -525,7 +577,10 @@ def process_single_file(filepath, output_dir):
             ws.insert_rows(INSERT_START_ROW, amount=total_insert_count)
             write_rule_legend(ws, 1)
 
-            for l, w in zip(['A','B','C','D','E','F','G','H'], [25, 15, 15, 15, 15, 15, 30, 20]): 
+            # Updated Columns: Added I (Dev+) and J (Dev-)
+            cols = ['A','B','C','D','E','F','G','H', 'I', 'J']
+            widths = [25, 15, 15, 15, 15, 15, 30, 20, 15, 15]
+            for l, w in zip(cols, widths): 
                 ws.column_dimensions[l].width = w
             
             r = INSERT_START_ROW
@@ -533,8 +588,8 @@ def process_single_file(filepath, output_dir):
             ws.cell(r,1).fill = PatternFill(start_color=COLOR_PURPLE_DARK, end_color=COLOR_PURPLE_DARK, fill_type="solid")
             r += 1
             
-            # Updated Headers to be clearer
-            headers = ["Feature", "Nominal", "LSL (Calc)", "USL (Calc)", "Mean", "StdDev", "Pattern / Status", "OOT Points"]
+            # Updated Headers: USL before LSL, (+) before (-)
+            headers = ["Feature", "Nominal", "USL (Calc)", "LSL (Calc)", "Mean", "StdDev", "Pattern / Status", "OOT Points", "Dev. Tol (+)", "Dev. Tol (-)"]
             for i, h in enumerate(headers, 1): style_header_cell(ws.cell(r, i, h))
             
             # Excel Formatting styles
@@ -555,19 +610,46 @@ def process_single_file(filepath, output_dir):
                 oot_count = np.sum(data > feat['usl']) + np.sum(data < feat['lsl']) if has_data else 0
                 oot_disp = f"{oot_count} FAILED ({(oot_count/len(data))*100:.1f}%)" if oot_count > 0 else 0
 
-                row_vals = [str(feat['name']), feat['nominal'], feat['lsl'], feat['usl'], mean, std_dev, status, oot_disp]
+                # --- DEVIATION TOLERANCE CALCULATION ---
+                dev_tol_minus = ""
+                dev_tol_plus = ""
+                
+                if has_data:
+                    data_min = np.min(data)
+                    data_max = np.max(data)
+                    
+                    if data_min < feat['lsl']:
+                        dev_tol_minus = feat['nominal'] - data_min
+                    
+                    if data_max > feat['usl']:
+                        dev_tol_plus = data_max - feat['nominal']
+
+                # Updated Row Order: Feature, Nom, USL, LSL, Mean, Std, Status, OOT, Dev+, Dev-
+                row_vals = [
+                    str(feat['name']), feat['nominal'], feat['usl'], feat['lsl'], 
+                    mean, std_dev, status, oot_disp, dev_tol_plus, dev_tol_minus
+                ]
+                
                 for c_idx, val in enumerate(row_vals, 1):
                     cell = ws.cell(r, c_idx, val)
-                    style_data_cell(cell, is_nominal=(c_idx==2), is_numeric=(has_data and c_idx in [2,3,4,5,6]))
+                    
+                    # Check if numeric (including new cols 9 and 10)
+                    is_num_col = (has_data and c_idx in [2,3,4,5,6,9,10] and isinstance(val, (int, float)))
+                    style_data_cell(cell, is_nominal=(c_idx==2), is_numeric=is_num_col)
+                    
+                    # Conditional Formatting Logic
+                    # c_idx 5 = Mean
                     if c_idx == 5 and has_data:
                         tb = feat['usl'] - feat['lsl']
                         if mean > feat['usl'] or mean < feat['lsl']: cell.fill, cell.font = f_fail, font_f
                         elif mean > (feat['usl'] - 0.1*tb) or mean < (feat['lsl'] + 0.1*tb): cell.fill, cell.font = f_warn, font_w
                         else: cell.fill, cell.font = f_pass, font_p
+                    # c_idx 7 = Status
                     if c_idx == 7 and has_data:
                         if is_unstable: cell.fill, cell.font = f_fail, font_f
                         elif "LIMITED" in status or "NO VAR" in status: cell.fill, cell.font = f_warn, font_w
                         else: cell.fill, cell.font = f_pass, font_p
+                    # c_idx 8 = OOT
                     if c_idx == 8 and has_data:
                         if oot_count > 0: cell.fill, cell.font = f_fail, font_f
                         else: cell.fill, cell.font = f_pass, font_p
@@ -592,7 +674,7 @@ def process_single_file(filepath, output_dir):
                     pdf.chapter_title(f"Feature: {name}", subtitle=f"Sheet: {sheet_name}")
                     
                     bell_path = create_bell_curve_plot(data, feat['usl'], feat['lsl'], feat['nominal'], 
-                                              feat['mean'], feat['sigma'], name, output_dir, f"BELL_{unique_prefix}")
+                                              feat['mean'], feat['sigma'], name, sheet_name, output_dir, f"BELL_{unique_prefix}")
                     temp_files.append(bell_path)
                     
                     pdf.image(bell_path, x=15, w=170)
@@ -688,7 +770,11 @@ def process_single_file(filepath, output_dir):
             # Styling original data rows
             grey_f, thin_b = PatternFill(start_color="E7E6E6", fill_type="solid"), Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
             for scan_row in range(total_insert_count + 1, ws.max_row + 1):
-                if str(ws.cell(scan_row, 1).value).strip() in ["Nominal", "USL", "LSL"]:
+                # Check for Flexible Labels used in this specific sheet
+                val_str = str(ws.cell(scan_row, 1).value).strip()
+                
+                # Check against the actual keys we found earlier
+                if val_str in [str(k) for k in metadata_keys if k is not None]:
                     for col_idx in range(1, ws.max_column + 1):
                         c = ws.cell(scan_row, col_idx)
                         c.fill, c.border = grey_f, thin_b

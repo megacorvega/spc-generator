@@ -7,7 +7,7 @@
   3. CALCULATES Analysis (Stats + Rules + Cpk)
   4. GENERATES PDF with SECTION BREAKS per Tab.
   
- Version: 4.7.0 (Helpful Error Handling for Visuals)
+ Version: 4.8.0 (Added dynamic Nominal handling from limits)
 """
 
 # --- IMPORTS ---
@@ -48,7 +48,7 @@ from rich import box
 console = Console()
 
 # --- CONSTANTS ---
-TOOL_VERSION = "4.7.0"
+TOOL_VERSION = "4.8.0"
 INPUT_PREFIX = "SPC_"        
 INSERT_START_ROW = 8   
 HEADER_SEARCH_ROWS = 7 # How many rows to scan for Part/Batch info
@@ -455,18 +455,18 @@ def process_single_file(filepath, output_dir):
             idx_ut = next((i for i in df_raw.index if "UPPER" in str(i).upper() and "TOL" in str(i).upper()), None)
             idx_lt = next((i for i in df_raw.index if "LOWER" in str(i).upper() and "TOL" in str(i).upper()), None)
 
-            if not idx_nom:
-                tab_log.append({
-                    'name': sheet_name, 
-                    'status': 'SKIP', 
-                    'msg': "Missing row labeled 'Nominal' (or similar) in Column A"
-                })
-                continue
-            
             # Verify we have EITHER Limits OR Tolerances
             has_limits = (idx_usl is not None and idx_lsl is not None)
             has_tols = (idx_ut is not None and idx_lt is not None)
 
+            if not idx_nom and not has_limits:
+                tab_log.append({
+                    'name': sheet_name, 
+                    'status': 'SKIP', 
+                    'msg': "Missing 'Nominal' row AND missing 'USL/LSL' rows."
+                })
+                continue
+            
             if not has_limits and not has_tols:
                  tab_log.append({
                     'name': sheet_name, 
@@ -484,8 +484,10 @@ def process_single_file(filepath, output_dir):
             
             for col in feature_cols:
                 try:
-                    nom_val = df_raw.loc[idx_nom, col]
-                    if pd.isna(nom_val) or str(nom_val).strip() == "": continue
+                    # Safely handle missing or blank Nominal entries
+                    nom_val = df_raw.loc[idx_nom, col] if idx_nom is not None else None
+                    has_nom = pd.notna(nom_val) and str(nom_val).strip() != ""
+                    nom_val_float = float(nom_val) if has_nom else None
                     
                     sample_idxs = [x for x in df_raw.index if x not in metadata_keys]
                     subset_indices = df_raw.loc[sample_idxs].index.tolist()
@@ -505,7 +507,6 @@ def process_single_file(filepath, output_dir):
                         except: pass
                     
                     # --- NEW LOGIC: DETERMINE LIMITS ---
-                    nom_val_float = float(nom_val)
                     usl_val, lsl_val = None, None
 
                     # 1. Try Absolute Limits first
@@ -513,13 +514,14 @@ def process_single_file(filepath, output_dir):
                         try:
                             raw_usl = df_raw.loc[idx_usl, col]
                             raw_lsl = df_raw.loc[idx_lsl, col]
-                            if pd.notna(raw_usl) and pd.notna(raw_lsl):
+                            if pd.notna(raw_usl) and str(raw_usl).strip() != "" and pd.notna(raw_lsl) and str(raw_lsl).strip() != "":
                                 usl_val = float(raw_usl)
                                 lsl_val = float(raw_lsl)
                         except: pass
                     
                     # 2. If no valid limits yet, try Tolerances
-                    if (usl_val is None or lsl_val is None) and has_tols:
+                    # (Note: Tolerances REQUIRE a base Nominal value to function)
+                    if (usl_val is None or lsl_val is None) and has_tols and has_nom:
                         try:
                             raw_ut = df_raw.loc[idx_ut, col]
                             raw_lt = df_raw.loc[idx_lt, col]
@@ -532,6 +534,10 @@ def process_single_file(filepath, output_dir):
                     # 3. Final Check
                     if usl_val is None or lsl_val is None:
                         continue # Skip feature if no limits can be determined
+
+                    # 4. Handle Missing Nominal (Compute Midpoint)
+                    if not has_nom:
+                        nom_val_float = (usl_val + lsl_val) / 2.0
 
                     # Fallback/Safety: If Limits end up identical
                     if usl_val == lsl_val:

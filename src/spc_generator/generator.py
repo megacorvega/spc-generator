@@ -229,9 +229,10 @@ def write_rule_legend(ws, start_row):
         ("Alternating", "14 consecutive points alternating up/down")
     ]
     
-    col_start = 12 
-    ws.column_dimensions['L'].width = 15
-    ws.column_dimensions['M'].width = 55
+    # Shifted to Column N (14) to avoid the new Dev columns
+    col_start = 14 
+    ws.column_dimensions['N'].width = 15
+    ws.column_dimensions['O'].width = 55
     
     head_r = ws.cell(start_row, col_start, "RULE REFERENCE")
     head_r.font = Font(bold=True, size=14, color="FFFFFF")
@@ -406,7 +407,6 @@ def process_single_file(filepath, output_dir):
             metadata = extract_sheet_metadata(ws_meta)
             
             # --- DYNAMIC HEADER DETECTION ---
-            # Finds where the table actually starts instead of hardcoding skiprows=7
             df_temp = pd.read_excel(filepath, sheet_name=sheet_name, header=None)
             header_row_idx = 7 # Fallback default
             for i in range(min(20, len(df_temp))):
@@ -498,7 +498,7 @@ def process_single_file(filepath, output_dir):
                         usl_val += 0.0001
                         lsl_val -= 0.0001
 
-                    # 6. Extract Samples Safely (Fixes Duplicate Index Crashes)
+                    # 6. Extract Samples Safely
                     sample_rows = df_raw[~df_raw.index.isin(metadata_keys)]
                     subset_indices = sample_rows.index.tolist()
                     subset_values = sample_rows[col].tolist()
@@ -521,7 +521,7 @@ def process_single_file(filepath, output_dir):
                     features_data.append({
                         'name': col, 
                         'nominal': nom_val_float, 
-                        'nominal_disp': nom_val_float if has_nom else "N/A", # Will display N/A if left blank
+                        'nominal_disp': nom_val_float if has_nom else "N/A", 
                         'usl': usl_val, 'lsl': lsl_val,
                         'data': np.array(clean_samples),
                         'split_locs': plot_split_locs,
@@ -531,7 +531,6 @@ def process_single_file(filepath, output_dir):
                     pdf_summary_data.append([sheet_name, col, f"{cpk:.2f}", "PASS" if cpk >= 1.33 else "FAIL"])
 
                 except Exception as e:
-                    # Will now log the exception instead of silently breaking
                     tab_log.append({'name': sheet_name, 'status': 'ERR', 'msg': f"Col {col} crashed: {str(e)}"})
                     continue
             
@@ -556,15 +555,16 @@ def process_single_file(filepath, output_dir):
             ws.insert_rows(INSERT_START_ROW, amount=total_insert_count)
             write_rule_legend(ws, 1)
 
+            # Updated Columns and Widths
             cols = ['A','B','C','D','E','F','G','H', 'I', 'J', 'K', 'L']
             widths = [25, 15, 15, 15, 15, 15, 30, 20, 15, 15, 15, 15]
             for l, w in zip(cols, widths): ws.column_dimensions[l].width = w
-
+            
             r = INSERT_START_ROW
             ws.cell(r,1,"ANALYSIS SUMMARY").font = Font(bold=True, size=14, color="FFFFFF")
             ws.cell(r,1).fill = PatternFill(start_color=COLOR_PURPLE_DARK, end_color=COLOR_PURPLE_DARK, fill_type="solid")
             r += 1
-
+            
             headers = ["Feature", "Nominal", "USL (Calc)", "LSL (Calc)", "Mean", "StdDev", "Pattern / Status", "OOT Points", "Dev. Tol (+)", "Dev. Tol (-)", "Dev. USL", "Dev. LSL"]
             for i, h in enumerate(headers, 1): style_header_cell(ws.cell(r, i, h))
             
@@ -584,6 +584,7 @@ def process_single_file(filepath, output_dir):
                 oot_count = np.sum(data > feat['usl']) + np.sum(data < feat['lsl']) if has_data else 0
                 oot_disp = f"{oot_count} FAILED ({(oot_count/len(data))*100:.1f}%)" if oot_count > 0 else 0
 
+                # New logic integrated here
                 dev_tol_minus = ""
                 dev_tol_plus = ""
                 dev_usl = ""
@@ -592,18 +593,21 @@ def process_single_file(filepath, output_dir):
                 if has_data:
                     data_min = np.min(data)
                     data_max = np.max(data)
-                    if data_min < feat['lsl']: 
-                        dev_tol_minus = feat['nominal'] - data_min
-                        dev_lsl = feat['lsl'] - data_min
-                    if data_max > feat['usl']: 
-                        dev_tol_plus = data_max - feat['nominal']
-                        dev_usl = data_max - feat['usl']
+                    
+                    dev_usl = data_max
+                    dev_lsl = data_min
+                    
+                    if feat['nominal_disp'] != "N/A":
+                        if data_min < feat['lsl']: 
+                            dev_tol_minus = feat['nominal'] - data_min
+                        if data_max > feat['usl']: 
+                            dev_tol_plus = data_max - feat['nominal']
 
                 row_vals = [
                     str(feat['name']), feat['nominal_disp'], feat['usl'], feat['lsl'], 
                     mean, std_dev, status, oot_disp, dev_tol_plus, dev_tol_minus, dev_usl, dev_lsl
                 ]
-
+                
                 for c_idx, val in enumerate(row_vals, 1):
                     cell = ws.cell(r, c_idx, val)
                     is_num_col = (has_data and c_idx in [2,3,4,5,6,9,10,11,12] and isinstance(val, (int, float)))
@@ -634,87 +638,97 @@ def process_single_file(filepath, output_dir):
                 has_data = len(data) >= 1
                 unique_prefix = f"{safe_name}_{i}"
                 
-                if has_data:
-                    pdf.add_page()
-                    pdf.chapter_title(f"Feature: {name}", subtitle=f"Sheet: {sheet_name}")
-                    
-                    bell_path = create_bell_curve_plot(data, feat['usl'], feat['lsl'], feat['nominal_disp'], 
-                                              feat['mean'], feat['sigma'], name, sheet_name, output_dir, f"BELL_{unique_prefix}")
-                    temp_files.append(bell_path)
-                    
-                    pdf.image(bell_path, x=15, w=170)
-                    pdf.ln(5)
-                    
-                    status_text = "CAPABLE" if feat['cpk'] >= 1.33 else "NOT CAPABLE"
-                    conclusion = (
-                        f"The process is statistically {status_text} (Cpk {feat['cpk']:.2f}). "
-                        f"The mean is centered at {feat['mean']:.4f}, with a standard deviation of {feat['sigma']:.4f}. "
-                    )
-                    
-                    pdf.chapter_title("Statistical Interpretation")
-                    pdf.body_text(conclusion)
-                    pdf.ln(5)
-                    
-                    # Formats N/A properly for the PDF table as well
-                    nom_str_pdf = f"{feat['nominal_disp']:.4f}" if isinstance(feat['nominal_disp'], (int, float)) else str(feat['nominal_disp'])
-                    
-                    metrics = [
-                        ("Nominal", nom_str_pdf),
-                        ("Tolerance", f"{feat['lsl']:.4f} to {feat['usl']:.4f}"),
-                        ("Process Mean", f"{feat['mean']:.4f}"),
-                        ("Sigma (Est)", f"{feat['sigma']:.5f}"),
-                        ("Cp (Potential)", f"{feat['cp']:.2f}"),
-                        ("Cpk (Actual)", f"{feat['cpk']:.2f}")
-                    ]
-                    pdf.add_stat_table(metrics)
-
+                # --- NO DATA HANDLING ---
                 if not has_data:
-                    img_path = create_summary_image(data, name, output_dir, i, safe_name, feat['usl'], feat['lsl'])
-                else:
-                    mean = np.mean(data)
-                    std_dev = np.std(data, ddof=1) if len(data) > 1 else 1e-9
-                    _, is_unstable, highlight_indices = check_spc_rules_full_scan(data, mean, std_dev)
+                    cell_name = ws.cell(img_start_row, 1, name)
+                    cell_name.font, cell_name.alignment = Font(bold=True, size=12), Alignment(vertical='top')
+                    
+                    cell_msg = ws.cell(img_start_row, 2, "NO DATA FOUND")
+                    cell_msg.font = Font(bold=True, italic=True, color="808080") # Grey, italic text
+                    cell_msg.alignment = Alignment(vertical='top')
+                    
+                    ws.row_dimensions[img_start_row].height = 15 # Keep row height normal
+                    img_start_row += 1
+                    continue # Skip the rest of the image generation for this feature
+                
+                # --- PDF REPORT GENERATION (Only runs if has_data is True) ---
+                pdf.add_page()
+                pdf.chapter_title(f"Feature: {name}", subtitle=f"Sheet: {sheet_name}")
+                
+                bell_path = create_bell_curve_plot(data, feat['usl'], feat['lsl'], feat['nominal_disp'], 
+                                          feat['mean'], feat['sigma'], name, sheet_name, output_dir, f"BELL_{unique_prefix}")
+                temp_files.append(bell_path)
+                
+                pdf.image(bell_path, x=15, w=170)
+                pdf.ln(5)
+                
+                status_text = "CAPABLE" if feat['cpk'] >= 1.33 else "NOT CAPABLE"
+                conclusion = (
+                    f"The process is statistically {status_text} (Cpk {feat['cpk']:.2f}). "
+                    f"The mean is centered at {feat['mean']:.4f}, with a standard deviation of {feat['sigma']:.4f}. "
+                )
+                
+                pdf.chapter_title("Statistical Interpretation")
+                pdf.body_text(conclusion)
+                pdf.ln(5)
+                
+                nom_str_pdf = f"{feat['nominal_disp']:.4f}" if isinstance(feat['nominal_disp'], (int, float)) else str(feat['nominal_disp'])
+                
+                metrics = [
+                    ("Nominal", nom_str_pdf),
+                    ("Tolerance", f"{feat['lsl']:.4f} to {feat['usl']:.4f}"),
+                    ("Process Mean", f"{feat['mean']:.4f}"),
+                    ("Sigma (Est)", f"{feat['sigma']:.5f}"),
+                    ("Cp (Potential)", f"{feat['cp']:.2f}"),
+                    ("Cpk (Actual)", f"{feat['cpk']:.2f}")
+                ]
+                pdf.add_stat_table(metrics)
 
-                    fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
-                    x_axis = np.arange(1, len(data) + 1)
-                    
-                    for s, c, a in [(1, 'green', 0.1), (2, 'yellow', 0.15), (3, 'red', 0.1)]:
-                        ax.fill_between(x_axis, mean+(s-1)*std_dev, mean+s*std_dev, color=c, alpha=a)
-                        ax.fill_between(x_axis, mean-(s-1)*std_dev, mean-s*std_dev, color=c, alpha=a)
+                # --- EXCEL CHART GENERATION ---
+                mean = np.mean(data)
+                std_dev = np.std(data, ddof=1) if len(data) > 1 else 1e-9
+                _, is_unstable, highlight_indices = check_spc_rules_full_scan(data, mean, std_dev)
 
-                    boundaries = [0] + feat['split_locs'] + [len(data)]
-                    for idx in range(len(boundaries) - 1):
-                        s_x, e_x = boundaries[idx], boundaries[idx+1]
-                        if idx > 0: ax.axvline(x=s_x + 0.5, color='black', ls='--', lw=1.5, alpha=0.8)
-                        if idx % 2 != 0: ax.axvspan(s_x + 0.5, e_x + 0.5, facecolor='#F2F2F2', alpha=0.5, zorder=0)
-                    
-                    all_vals = np.concatenate([data, [feat['usl'], feat['lsl'], mean+3*std_dev, mean-3*std_dev]])
-                    y_min_v, y_max_v = np.min(all_vals), np.max(all_vals)
-                    y_rng = max(y_max_v - y_min_v, 1e-9)
-                    y_bottom, y_top = y_min_v - (y_rng * 0.15), y_max_v + (y_rng * 0.15)
-                    ax.set_ylim(y_bottom, y_top)
-                    
-                    ax.axhspan(feat['usl'], y_top, facecolor='none', hatch='////', edgecolor='#FF9999', alpha=0.5)
-                    ax.axhspan(y_bottom, feat['lsl'], facecolor='none', hatch='////', edgecolor='#FF9999', alpha=0.5)
+                fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
+                x_axis = np.arange(1, len(data) + 1)
+                
+                for s, c, a in [(1, 'green', 0.1), (2, 'yellow', 0.15), (3, 'red', 0.1)]:
+                    ax.fill_between(x_axis, mean+(s-1)*std_dev, mean+s*std_dev, color=c, alpha=a)
+                    ax.fill_between(x_axis, mean-(s-1)*std_dev, mean-s*std_dev, color=c, alpha=a)
 
-                    ax.set_xlabel('Samples', fontweight='bold')
-                    ax.set_ylabel('Dimension (in)', fontweight='bold')
-                    ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.4f')) 
-                    
-                    ax.axhline(mean, color='green')
-                    ax.axhline(feat['usl'], color='red')
-                    ax.axhline(feat['lsl'], color='red')
-                    ax.plot(x_axis, data, marker='o', color='black', lw=1, ms=4)
-                    
-                    oot_mask = (data > feat['usl']) | (data < feat['lsl'])
-                    ax.plot(x_axis[oot_mask], data[oot_mask], 'x', color='red', ms=8, mew=2)
-                    if is_unstable:
-                        ax.plot(x_axis[highlight_indices], data[highlight_indices], 'o', color='red', ms=10, mfc='none', mew=2)
+                boundaries = [0] + feat['split_locs'] + [len(data)]
+                for idx in range(len(boundaries) - 1):
+                    s_x, e_x = boundaries[idx], boundaries[idx+1]
+                    if idx > 0: ax.axvline(x=s_x + 0.5, color='black', ls='--', lw=1.5, alpha=0.8)
+                    if idx % 2 != 0: ax.axvspan(s_x + 0.5, e_x + 0.5, facecolor='#F2F2F2', alpha=0.5, zorder=0)
+                
+                all_vals = np.concatenate([data, [feat['usl'], feat['lsl'], mean+3*std_dev, mean-3*std_dev]])
+                y_min_v, y_max_v = np.min(all_vals), np.max(all_vals)
+                y_rng = max(y_max_v - y_min_v, 1e-9)
+                y_bottom, y_top = y_min_v - (y_rng * 0.15), y_max_v + (y_rng * 0.15)
+                ax.set_ylim(y_bottom, y_top)
+                
+                ax.axhspan(feat['usl'], y_top, facecolor='none', hatch='////', edgecolor='#FF9999', alpha=0.5)
+                ax.axhspan(y_bottom, feat['lsl'], facecolor='none', hatch='////', edgecolor='#FF9999', alpha=0.5)
 
-                    ax.set_title(f"{name}", fontweight='bold')
-                    img_path = os.path.join(output_dir, f"TEMP_CHART_{unique_prefix}.png")
-                    plt.savefig(img_path, bbox_inches='tight')
-                    plt.close(fig)
+                ax.set_xlabel('Samples', fontweight='bold')
+                ax.set_ylabel('Dimension (in)', fontweight='bold')
+                ax.yaxis.set_major_formatter(plt.FormatStrFormatter('%.4f')) 
+                
+                ax.axhline(mean, color='green')
+                ax.axhline(feat['usl'], color='red')
+                ax.axhline(feat['lsl'], color='red')
+                ax.plot(x_axis, data, marker='o', color='black', lw=1, ms=4)
+                
+                oot_mask = (data > feat['usl']) | (data < feat['lsl'])
+                ax.plot(x_axis[oot_mask], data[oot_mask], 'x', color='red', ms=8, mew=2)
+                if is_unstable:
+                    ax.plot(x_axis[highlight_indices], data[highlight_indices], 'o', color='red', ms=10, mfc='none', mew=2)
+
+                ax.set_title(f"{name}", fontweight='bold')
+                img_path = os.path.join(output_dir, f"TEMP_CHART_{unique_prefix}.png")
+                plt.savefig(img_path, bbox_inches='tight')
+                plt.close(fig)
 
                 temp_files.append(img_path)
                 img = XLImage(img_path)

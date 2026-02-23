@@ -3,11 +3,11 @@
  ----------------------------------------------------------------------
  Logic:
   1. SCANS for tabs starting with "SPC_"
-  2. EXTRACTS HEADER ROWS (1-7) to find Part #, Batch, Date, etc.
+  2. EXTRACTS HEADER ROWS to find Part #, Batch, Date, etc.
   3. CALCULATES Analysis (Stats + Rules + Cpk)
   4. GENERATES PDF with SECTION BREAKS per Tab.
   
- Version: 4.8.1 (Ultra-resilient limits and missing Nominal extraction)
+ Version: 4.8.2 (Dynamic Headers, Strict Indexing, Blank Nominal Support)
 """
 
 # --- IMPORTS ---
@@ -48,10 +48,10 @@ from rich import box
 console = Console()
 
 # --- CONSTANTS ---
-TOOL_VERSION = "4.8.1"
+TOOL_VERSION = "4.8.2"
 INPUT_PREFIX = "SPC_"        
 INSERT_START_ROW = 8   
-HEADER_SEARCH_ROWS = 7 # How many rows to scan for Part/Batch info
+HEADER_SEARCH_ROWS = 7 
 
 # --- COLORS ---
 COLOR_PURPLE_DARK = "7030A0"   
@@ -153,56 +153,43 @@ def get_unique_filepath(filepath):
 
 def wait_for_file_access(filepath):
     if not os.path.exists(filepath): return
-    while True:
+    retries = 0
+    while retries < 3: 
         try:
             with open(filepath, 'a'): break
         except IOError:
             console.print(f"[yellow]WAITING:[/yellow] File {os.path.basename(filepath)} is open. Close it to continue.")
             time.sleep(2)
+            retries += 1
+    else:
+        raise PermissionError("File is currently open in another program (like Excel). Please close it and run again.")
 
 def sanitize_filename(filename):
     return re.sub(r'[\\/*?:"<>|]', "", str(filename))
 
 def extract_sheet_metadata(ws):
-    """
-    Scans the first 7 rows of the worksheet to find Header Info.
-    Looks for pattern: "Label:" -> "Value" in adjacent cell.
-    """
     metadata = {}
-    
-    # Priority Keywords we want to grab specifically if they exist
     target_keys = ["PART", "BATCH", "DATE", "NOTE", "OPERATOR", "MACHINE", "ORDER", "LOT"]
-    
-    # Scan first 7 rows, first 10 columns
     for row in ws.iter_rows(min_row=1, max_row=HEADER_SEARCH_ROWS, min_col=1, max_col=10):
         for cell in row:
             if cell.value and isinstance(cell.value, str):
                 val_str = str(cell.value).strip().rstrip(':')
-                
-                # Check if this cell is a Label (contains one of our targets)
-                is_target = any(k in val_str.upper() for k in target_keys)
-                
-                if is_target:
-                    # Look at the cell to the RIGHT for the value
+                if any(k in val_str.upper() for k in target_keys):
                     next_col_idx = cell.column + 1
                     neighbor = ws.cell(row=cell.row, column=next_col_idx).value
                     if neighbor:
                         metadata[val_str] = str(neighbor)
-                        
     return metadata
 
 def calculate_cpk(data, usl, lsl):
     if len(data) < 2: return 0, 0, 0, 0
     mean = np.mean(data)
     sigma = np.std(data, ddof=1)
-    
-    if sigma < 1e-9: sigma = 1e-9 # Prevent divide by zero
-        
+    if sigma < 1e-9: sigma = 1e-9 
     cpu = (usl - mean) / (3 * sigma)
     cpl = (mean - lsl) / (3 * sigma)
     cpk = min(cpu, cpl)
     cp = (usl - lsl) / (6 * sigma)
-    
     return cp, cpk, mean, sigma
 
 # --- EXCEL FORMATTING UTILS ---
@@ -230,7 +217,6 @@ def shift_existing_images(ws, insertion_row, count):
                         img.anchor.to.row += count
         except Exception: pass
 
-# --- LEGEND GENERATOR ---
 def write_rule_legend(ws, start_row):
     legend_data = [
         ("WECO Rule 1", "Any single point outside 3σ limit"),
@@ -243,7 +229,7 @@ def write_rule_legend(ws, start_row):
         ("Alternating", "14 consecutive points alternating up/down")
     ]
     
-    col_start = 12 # Column L
+    col_start = 12 
     ws.column_dimensions['L'].width = 15
     ws.column_dimensions['M'].width = 55
     
@@ -304,15 +290,14 @@ def check_spc_rules_full_scan(data, mean, std_dev):
         if n < 8: return f"LIMITED DATA (N={n})", False, []
         return "STABLE", False, []
 
-    except Exception as e:
+    except Exception:
         return "CALC ERROR", False, []
 
-# --- PLOTTING 1: CONTROL CHARTS (For Excel) ---
+# --- PLOTTING 1: CONTROL CHARTS ---
 def create_summary_image(data_array, title, output_folder, index, prefix, usl_val, lsl_val):
     fig = plt.figure(figsize=(10, 5), dpi=100)
     ax = fig.add_subplot(111)
     ax.axis('off')
-    
     count = len(data_array)
     if count > 0:
         val_avg = np.mean(data_array)
@@ -325,7 +310,6 @@ def create_summary_image(data_array, title, output_folder, index, prefix, usl_va
         )
     else:
         text_str = f"NO DATA FOUND"
-
     ax.text(0.1, 0.5, text_str, transform=ax.transAxes, fontsize=12, fontfamily='monospace')
     clean_name = sanitize_filename(title)
     save_path = os.path.join(output_folder, f"TEMP_SUM_{prefix}_{clean_name}_{index}.png")
@@ -333,13 +317,9 @@ def create_summary_image(data_array, title, output_folder, index, prefix, usl_va
     plt.close(fig)
     return save_path
 
-# --- PLOTTING 2: BELL CURVES (For PDF) ---
-def create_bell_curve_plot(data, usl, lsl, nominal, mean, sigma, feature_name, sheet_name, output_dir, prefix):
-    # Check for insufficient variation or data (Prevents Divide by Zero error)
+# --- PLOTTING 2: BELL CURVES ---
+def create_bell_curve_plot(data, usl, lsl, nominal_disp, mean, sigma, feature_name, sheet_name, output_dir, prefix):
     if sigma <= 1e-9:
-        console.print(f"[{sheet_name}] [{feature_name}] - Cannot create visual, not enough data or no variation.", style="bold yellow")
-        
-        # Create placeholder
         plt.figure(figsize=(10, 6))
         plt.text(0.5, 0.5, "Cannot generate Bell Curve:\nInsufficient Variation or Data", 
                  horizontalalignment='center', verticalalignment='center', transform=plt.gca().transAxes, fontsize=14)
@@ -351,22 +331,21 @@ def create_bell_curve_plot(data, usl, lsl, nominal, mean, sigma, feature_name, s
         return save_path
 
     plt.figure(figsize=(10, 6))
-    
-    # Generate X axis focused on the data/tolerance
     effective_sigma = max(sigma, (usl-lsl)/20) 
     spread = max((usl-lsl), (6*effective_sigma)) * 1.5
     
     x = np.linspace(mean - spread/2, mean + spread/2, 1000)
     y = norm.pdf(x, mean, sigma)
     
-    # Plot formatting
     plt.plot(x, y, color='blue', linewidth=2, label=f'Process (σ={sigma:.4f})')
     plt.fill_between(x, y, alpha=0.2, color='blue')
     
-    # Limits
     plt.axvline(lsl, color='red', linestyle='--', linewidth=2, label=f'LSL ({lsl})')
     plt.axvline(usl, color='red', linestyle='--', linewidth=2, label=f'USL ({usl})')
-    plt.axvline(nominal, color='black', linestyle=':', linewidth=1, label='Nominal')
+    
+    if isinstance(nominal_disp, (int, float)):
+        plt.axvline(nominal_disp, color='black', linestyle=':', linewidth=1, label=f'Nominal ({nominal_disp})')
+        
     plt.axvline(mean, color='green', linestyle='-', linewidth=1, label=f'Mean ({mean:.4f})')
 
     plt.title(f'Capability Analysis: {feature_name}', fontsize=12, fontweight='bold')
@@ -395,8 +374,7 @@ def process_single_file(filepath, output_dir):
     output_path = get_unique_filepath(str(target_path))
     pdf_path = get_unique_filepath(str(output_dir / pdf_filename))
     
-    # TRACKING LOGS
-    tab_log = [] # Stores: {'name': str, 'status': 'OK'|'SKIP'|'ERR', 'msg': str}
+    tab_log = []
 
     try:
         wb_output = load_workbook(filepath)
@@ -409,7 +387,6 @@ def process_single_file(filepath, output_dir):
     processed_tabs = []
     temp_files = [] 
     
-    # Initialize PDF
     pdf = WhitePaperPDF(filename)
     pdf.add_page()
     pdf.chapter_title(f"Executive Summary")
@@ -420,91 +397,74 @@ def process_single_file(filepath, output_dir):
     pdf_summary_data = []
 
     for sheet_name in all_sheet_names:
-        # --- CHECK 1: TAB NAMING CONVENTION ---
         if not sheet_name.startswith(INPUT_PREFIX):
-            tab_log.append({
-                'name': sheet_name, 
-                'status': 'SKIP', 
-                'msg': f"Tab name must start with '{INPUT_PREFIX}'"
-            })
+            tab_log.append({'name': sheet_name, 'status': 'SKIP', 'msg': f"Tab name must start with '{INPUT_PREFIX}'"})
             continue
 
         try:
             ws_meta = wb_output[sheet_name]
             metadata = extract_sheet_metadata(ws_meta)
             
-            # --- CHECK 2: LOAD DATA ---
-            try:
-                df_raw = pd.read_excel(filepath, sheet_name=sheet_name, header=0, skiprows=7)
-            except Exception as e:
-                tab_log.append({'name': sheet_name, 'status': 'ERR', 'msg': f"Pandas Read Error: {str(e)}"})
-                continue
+            # --- DYNAMIC HEADER DETECTION ---
+            # Finds where the table actually starts instead of hardcoding skiprows=7
+            df_temp = pd.read_excel(filepath, sheet_name=sheet_name, header=None)
+            header_row_idx = 7 # Fallback default
+            for i in range(min(20, len(df_temp))):
+                first_cell = str(df_temp.iloc[i, 0]).strip().upper()
+                if first_cell in ["FEATURE NAME", "FEATURE", "DIMENSION", "DIM"]:
+                    header_row_idx = i
+                    break
+                    
+            df_raw = pd.read_excel(filepath, sheet_name=sheet_name, header=header_row_idx)
 
             if df_raw.shape[1] > 0 and df_raw.columns[0] not in df_raw.index.names:
                 df_raw.set_index(df_raw.columns[0], inplace=True)
 
-            # --- CHECK 3: SMART LABEL DETECTION ---
-            # Identify which row labels are being used
-            idx_nom = next((i for i in df_raw.index if "NOMINAL" in str(i).upper() or "NOM" in str(i).upper()), None)
-            
-            # Look for explicit Limits (USL/LSL)
-            idx_usl = next((i for i in df_raw.index if "USL" in str(i).upper() or "MAX" in str(i).upper() or "UPPER LIMIT" in str(i).upper()), None)
-            idx_lsl = next((i for i in df_raw.index if "LSL" in str(i).upper() or "MIN" in str(i).upper() or "LOWER LIMIT" in str(i).upper()), None)
-            
-            # Look for Tolerances (Upper Tol/Lower Tol)
-            idx_ut = next((i for i in df_raw.index if "UPPER" in str(i).upper() and "TOL" in str(i).upper()), None)
-            idx_lt = next((i for i in df_raw.index if "LOWER" in str(i).upper() and "TOL" in str(i).upper()), None)
+            # --- STRICT LABEL IDENTIFICATION ---
+            idx_nom, idx_usl, idx_lsl, idx_ut, idx_lt = None, None, None, None, None
+            for i in df_raw.index:
+                val = str(i).strip().upper()
+                if not idx_nom and val in ["NOMINAL", "NOM", "TARGET"]: idx_nom = i
+                elif not idx_usl and val in ["USL", "MAX", "UPPER LIMIT", "UPPER SPEC"]: idx_usl = i
+                elif not idx_lsl and val in ["LSL", "MIN", "LOWER LIMIT", "LOWER SPEC"]: idx_lsl = i
+                elif not idx_ut and ("UPPER" in val and "TOL" in val): idx_ut = i
+                elif not idx_lt and ("LOWER" in val and "TOL" in val): idx_lt = i
 
-            # Verify we have EITHER Limits OR Tolerances
             has_limits = (idx_usl is not None and idx_lsl is not None)
             has_tols = (idx_ut is not None and idx_lt is not None)
 
             if not idx_nom and not has_limits:
-                tab_log.append({
-                    'name': sheet_name, 
-                    'status': 'SKIP', 
-                    'msg': "Missing 'Nominal' row AND missing 'USL/LSL' rows."
-                })
+                tab_log.append({'name': sheet_name, 'status': 'SKIP', 'msg': "Missing 'Nominal' row AND missing 'USL/LSL' rows."})
                 continue
             
             if not has_limits and not has_tols:
-                 tab_log.append({
-                    'name': sheet_name, 
-                    'status': 'SKIP', 
-                    'msg': "Could not find limits. Need rows for 'USL/LSL' OR 'Upper/Lower Tolerance'"
-                })
+                 tab_log.append({'name': sheet_name, 'status': 'SKIP', 'msg': "Could not find limits. Need rows for 'USL/LSL' OR 'Upper/Lower Tolerance'"})
                  continue
 
             feature_cols = [c for c in df_raw.columns if "Unnamed" not in str(c)]
-            
-            # We must exclude ALL potential spec rows from the data samples
             metadata_keys = [x for x in [idx_nom, idx_usl, idx_lsl, idx_ut, idx_lt] if x is not None]
             
             features_data = []
             
             for col in feature_cols:
                 try:
-                    # 1. Safely Extract Nominal (Ignore string placeholders like "-" or "N/A")
+                    # 1. Extract Nominal
                     nom_val_float = None
                     if idx_nom is not None:
                         nom_raw = df_raw.loc[idx_nom, col]
                         if pd.notna(nom_raw):
                             nom_str = str(nom_raw).strip().upper()
                             if nom_str not in ["", "NAN", "NULL", "NONE", "N/A", "-"]:
-                                try:
-                                    nom_val_float = float(nom_raw)
-                                except Exception:
-                                    pass # Could not parse, treat as missing
+                                try: nom_val_float = float(nom_raw)
+                                except ValueError: pass
                     
                     has_nom = (nom_val_float is not None)
 
-                    # 2. Extract Limits Safely
+                    # 2. Extract Absolute Limits
                     usl_val, lsl_val = None, None
-                    
                     if has_limits:
                         raw_usl = df_raw.loc[idx_usl, col]
                         raw_lsl = df_raw.loc[idx_lsl, col]
-                        
                         if pd.notna(raw_usl) and pd.notna(raw_lsl):
                             u_str = str(raw_usl).strip().upper()
                             l_str = str(raw_lsl).strip().upper()
@@ -512,10 +472,9 @@ def process_single_file(filepath, output_dir):
                                 try:
                                     usl_val = float(raw_usl)
                                     lsl_val = float(raw_lsl)
-                                except Exception:
-                                    pass
+                                except ValueError: pass
 
-                    # 3. Extract Limits via Tolerances (if absolute limits missing)
+                    # 3. Extract Tolerances
                     if (usl_val is None or lsl_val is None) and has_tols and has_nom:
                         raw_ut = df_raw.loc[idx_ut, col]
                         raw_lt = df_raw.loc[idx_lt, col]
@@ -526,46 +485,43 @@ def process_single_file(filepath, output_dir):
                                 try:
                                     usl_val = nom_val_float + abs(float(raw_ut))
                                     lsl_val = nom_val_float - abs(float(raw_lt))
-                                except Exception:
-                                    pass
+                                except ValueError: pass
 
-                    # 4. Final Verification
                     if usl_val is None or lsl_val is None:
-                        continue # MUST skip this feature; no limits available
+                        continue 
                         
-                    # 5. Missing Nominal Midpoint Fallback
+                    # 5. Missing Nominal Midpoint
                     if not has_nom:
                         nom_val_float = (usl_val + lsl_val) / 2.0
 
-                    # Safety check for identical limits
                     if usl_val == lsl_val:
                         usl_val += 0.0001
                         lsl_val -= 0.0001
 
-                    # 6. Extract Sample Data
-                    sample_idxs = [x for x in df_raw.index if x not in metadata_keys]
-                    subset_indices = df_raw.loc[sample_idxs].index.tolist()
-                    subset_values = df_raw.loc[sample_idxs, col].tolist()
+                    # 6. Extract Samples Safely (Fixes Duplicate Index Crashes)
+                    sample_rows = df_raw[~df_raw.index.isin(metadata_keys)]
+                    subset_indices = sample_rows.index.tolist()
+                    subset_values = sample_rows[col].tolist()
                     
                     clean_samples = []
                     plot_split_locs = [] 
                     
                     for i, (label, val) in enumerate(zip(subset_indices, subset_values)):
-                        is_split = (str(label).upper().strip() == "SPLIT" or str(val).upper().strip() == "SPLIT")
-                        if is_split:
+                        if str(label).upper().strip() == "SPLIT" or str(val).upper().strip() == "SPLIT":
                             plot_split_locs.append(len(clean_samples))
                             continue
                         try:
                             num = float(val)
                             if not np.isnan(num): 
                                 clean_samples.append(num)
-                        except Exception: 
-                            pass
+                        except (ValueError, TypeError): pass
                             
                     cp, cpk, mean_val, sigma_val = calculate_cpk(np.array(clean_samples), usl_val, lsl_val)
                     
                     features_data.append({
-                        'name': col, 'nominal': nom_val_float,
+                        'name': col, 
+                        'nominal': nom_val_float, 
+                        'nominal_disp': nom_val_float if has_nom else "N/A", # Will display N/A if left blank
                         'usl': usl_val, 'lsl': lsl_val,
                         'data': np.array(clean_samples),
                         'split_locs': plot_split_locs,
@@ -574,15 +530,13 @@ def process_single_file(filepath, output_dir):
                     
                     pdf_summary_data.append([sheet_name, col, f"{cpk:.2f}", "PASS" if cpk >= 1.33 else "FAIL"])
 
-                except Exception: 
+                except Exception as e:
+                    # Will now log the exception instead of silently breaking
+                    tab_log.append({'name': sheet_name, 'status': 'ERR', 'msg': f"Col {col} crashed: {str(e)}"})
                     continue
             
             if not features_data: 
-                tab_log.append({
-                    'name': sheet_name, 
-                    'status': 'SKIP', 
-                    'msg': "No valid columns found (Check USL/LSL/Nominal)"
-                })
+                tab_log.append({'name': sheet_name, 'status': 'SKIP', 'msg': "No valid columns found (Check USL/LSL/Nominal)"})
                 continue
 
             # --- PART 3: EXCEL GENERATION ---
@@ -602,22 +556,18 @@ def process_single_file(filepath, output_dir):
             ws.insert_rows(INSERT_START_ROW, amount=total_insert_count)
             write_rule_legend(ws, 1)
 
-            # Updated Columns: Added I (Dev+) and J (Dev-)
             cols = ['A','B','C','D','E','F','G','H', 'I', 'J']
             widths = [25, 15, 15, 15, 15, 15, 30, 20, 15, 15]
-            for l, w in zip(cols, widths): 
-                ws.column_dimensions[l].width = w
+            for l, w in zip(cols, widths): ws.column_dimensions[l].width = w
             
             r = INSERT_START_ROW
             ws.cell(r,1,"ANALYSIS SUMMARY").font = Font(bold=True, size=14, color="FFFFFF")
             ws.cell(r,1).fill = PatternFill(start_color=COLOR_PURPLE_DARK, end_color=COLOR_PURPLE_DARK, fill_type="solid")
             r += 1
             
-            # Updated Headers: USL before LSL, (+) before (-)
             headers = ["Feature", "Nominal", "USL (Calc)", "LSL (Calc)", "Mean", "StdDev", "Pattern / Status", "OOT Points", "Dev. Tol (+)", "Dev. Tol (-)"]
             for i, h in enumerate(headers, 1): style_header_cell(ws.cell(r, i, h))
             
-            # Excel Formatting styles
             f_pass, font_p = PatternFill(start_color="C6EFCE", fill_type="solid"), Font(color="006100", bold=True)
             f_warn, font_w = PatternFill(start_color="FFEB9C", fill_type="solid"), Font(color="9C6500", bold=True)
             f_fail, font_f = PatternFill(start_color="FFC7CE", fill_type="solid"), Font(color="9C0006", bold=True)
@@ -627,7 +577,6 @@ def process_single_file(filepath, output_dir):
                 data = feat['data']
                 has_data = len(data) >= 1
                 
-                # Re-calculate stats for Excel logic
                 mean = np.mean(data) if has_data else 0
                 std_dev = np.std(data, ddof=1) if has_data and len(data) > 1 else 0
                 
@@ -635,46 +584,34 @@ def process_single_file(filepath, output_dir):
                 oot_count = np.sum(data > feat['usl']) + np.sum(data < feat['lsl']) if has_data else 0
                 oot_disp = f"{oot_count} FAILED ({(oot_count/len(data))*100:.1f}%)" if oot_count > 0 else 0
 
-                # --- DEVIATION TOLERANCE CALCULATION ---
                 dev_tol_minus = ""
                 dev_tol_plus = ""
                 
                 if has_data:
                     data_min = np.min(data)
                     data_max = np.max(data)
-                    
-                    if data_min < feat['lsl']:
-                        dev_tol_minus = feat['nominal'] - data_min
-                    
-                    if data_max > feat['usl']:
-                        dev_tol_plus = data_max - feat['nominal']
+                    if data_min < feat['lsl']: dev_tol_minus = feat['nominal'] - data_min
+                    if data_max > feat['usl']: dev_tol_plus = data_max - feat['nominal']
 
-                # Updated Row Order: Feature, Nom, USL, LSL, Mean, Std, Status, OOT, Dev+, Dev-
                 row_vals = [
-                    str(feat['name']), feat['nominal'], feat['usl'], feat['lsl'], 
+                    str(feat['name']), feat['nominal_disp'], feat['usl'], feat['lsl'], 
                     mean, std_dev, status, oot_disp, dev_tol_plus, dev_tol_minus
                 ]
                 
                 for c_idx, val in enumerate(row_vals, 1):
                     cell = ws.cell(r, c_idx, val)
-                    
-                    # Check if numeric (including new cols 9 and 10)
                     is_num_col = (has_data and c_idx in [2,3,4,5,6,9,10] and isinstance(val, (int, float)))
                     style_data_cell(cell, is_nominal=(c_idx==2), is_numeric=is_num_col)
                     
-                    # Conditional Formatting Logic
-                    # c_idx 5 = Mean
                     if c_idx == 5 and has_data:
                         tb = feat['usl'] - feat['lsl']
                         if mean > feat['usl'] or mean < feat['lsl']: cell.fill, cell.font = f_fail, font_f
                         elif mean > (feat['usl'] - 0.1*tb) or mean < (feat['lsl'] + 0.1*tb): cell.fill, cell.font = f_warn, font_w
                         else: cell.fill, cell.font = f_pass, font_p
-                    # c_idx 7 = Status
                     if c_idx == 7 and has_data:
                         if is_unstable: cell.fill, cell.font = f_fail, font_f
                         elif "LIMITED" in status or "NO VAR" in status: cell.fill, cell.font = f_warn, font_w
                         else: cell.fill, cell.font = f_pass, font_p
-                    # c_idx 8 = OOT
                     if c_idx == 8 and has_data:
                         if oot_count > 0: cell.fill, cell.font = f_fail, font_f
                         else: cell.fill, cell.font = f_pass, font_p
@@ -683,22 +620,19 @@ def process_single_file(filepath, output_dir):
             r += 1 
             img_start_row = r
             
-            # --- PART 4: PDF SECTION START ---
             pdf.add_section_header(sheet_name, metadata)
 
-            # --- PART 5: CHARTS & BELL CURVES ---
             for i, feat in enumerate(features_data):
                 data = feat['data']
                 name = str(feat['name'])
                 has_data = len(data) >= 1
                 unique_prefix = f"{safe_name}_{i}"
                 
-                # --- A. PDF GENERATION (Bell Curve) ---
                 if has_data:
                     pdf.add_page()
                     pdf.chapter_title(f"Feature: {name}", subtitle=f"Sheet: {sheet_name}")
                     
-                    bell_path = create_bell_curve_plot(data, feat['usl'], feat['lsl'], feat['nominal'], 
+                    bell_path = create_bell_curve_plot(data, feat['usl'], feat['lsl'], feat['nominal_disp'], 
                                               feat['mean'], feat['sigma'], name, sheet_name, output_dir, f"BELL_{unique_prefix}")
                     temp_files.append(bell_path)
                     
@@ -715,8 +649,11 @@ def process_single_file(filepath, output_dir):
                     pdf.body_text(conclusion)
                     pdf.ln(5)
                     
+                    # Formats N/A properly for the PDF table as well
+                    nom_str_pdf = f"{feat['nominal_disp']:.4f}" if isinstance(feat['nominal_disp'], (int, float)) else str(feat['nominal_disp'])
+                    
                     metrics = [
-                        ("Nominal", f"{feat['nominal']:.4f}"),
+                        ("Nominal", nom_str_pdf),
                         ("Tolerance", f"{feat['lsl']:.4f} to {feat['usl']:.4f}"),
                         ("Process Mean", f"{feat['mean']:.4f}"),
                         ("Sigma (Est)", f"{feat['sigma']:.5f}"),
@@ -725,7 +662,6 @@ def process_single_file(filepath, output_dir):
                     ]
                     pdf.add_stat_table(metrics)
 
-                # --- B. EXCEL CONTROL CHART (Time Series) ---
                 if not has_data:
                     img_path = create_summary_image(data, name, output_dir, i, safe_name, feat['usl'], feat['lsl'])
                 else:
@@ -736,26 +672,22 @@ def process_single_file(filepath, output_dir):
                     fig, ax = plt.subplots(figsize=(10, 5), dpi=100)
                     x_axis = np.arange(1, len(data) + 1)
                     
-                    # Sigma Bands
                     for s, c, a in [(1, 'green', 0.1), (2, 'yellow', 0.15), (3, 'red', 0.1)]:
                         ax.fill_between(x_axis, mean+(s-1)*std_dev, mean+s*std_dev, color=c, alpha=a)
                         ax.fill_between(x_axis, mean-(s-1)*std_dev, mean-s*std_dev, color=c, alpha=a)
 
-                    # Splits
                     boundaries = [0] + feat['split_locs'] + [len(data)]
                     for idx in range(len(boundaries) - 1):
                         s_x, e_x = boundaries[idx], boundaries[idx+1]
                         if idx > 0: ax.axvline(x=s_x + 0.5, color='black', ls='--', lw=1.5, alpha=0.8)
                         if idx % 2 != 0: ax.axvspan(s_x + 0.5, e_x + 0.5, facecolor='#F2F2F2', alpha=0.5, zorder=0)
                     
-                    # Manual Y-Limits for consistent Hatching
                     all_vals = np.concatenate([data, [feat['usl'], feat['lsl'], mean+3*std_dev, mean-3*std_dev]])
                     y_min_v, y_max_v = np.min(all_vals), np.max(all_vals)
                     y_rng = max(y_max_v - y_min_v, 1e-9)
                     y_bottom, y_top = y_min_v - (y_rng * 0.15), y_max_v + (y_rng * 0.15)
                     ax.set_ylim(y_bottom, y_top)
                     
-                    # Hatching OOT
                     ax.axhspan(feat['usl'], y_top, facecolor='none', hatch='////', edgecolor='#FF9999', alpha=0.5)
                     ax.axhspan(y_bottom, feat['lsl'], facecolor='none', hatch='////', edgecolor='#FF9999', alpha=0.5)
 
@@ -792,26 +724,20 @@ def process_single_file(filepath, output_dir):
                 cell.font, cell.alignment = Font(bold=True, size=12), Alignment(vertical='top')
                 img_start_row += 1
 
-            # Styling original data rows
             grey_f, thin_b = PatternFill(start_color="E7E6E6", fill_type="solid"), Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
             for scan_row in range(total_insert_count + 1, ws.max_row + 1):
-                # Check for Flexible Labels used in this specific sheet
                 val_str = str(ws.cell(scan_row, 1).value).strip()
-                
-                # Check against the actual keys we found earlier
                 if val_str in [str(k) for k in metadata_keys if k is not None]:
                     for col_idx in range(1, ws.max_column + 1):
                         c = ws.cell(scan_row, col_idx)
                         c.fill, c.border = grey_f, thin_b
             
-            # LOG SUCCESS
             tab_log.append({'name': sheet_name, 'status': 'OK', 'msg': f"Processed {len(features_data)} features"})
 
         except Exception as e:
             tab_log.append({'name': sheet_name, 'status': 'ERR', 'msg': str(e)})
             continue
 
-    # Finalize PDF Summary Page
     if processed_tabs:
         pdf.page = 1
         pdf.set_y(50)
@@ -843,7 +769,6 @@ def process_single_file(filepath, output_dir):
     
     return {"processed": processed_tabs, "logs": tab_log, "ignored": []}
 
-# --- MAIN ---
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
     if os.name == 'nt': os.system(f'title SPC Tool v{TOOL_VERSION}')
@@ -867,7 +792,6 @@ def main():
         questionary.press_any_key_to_continue().ask()
         return
 
-    # --- LAUNCHER LOGIC ---
     launcher_options = [
         "[ ▶ PROCESS ALL FILES ]",
         "[ ▶ SELECT MULTIPLE... ]",
@@ -904,7 +828,6 @@ def main():
         console.print("[red]No files selected. Exiting.[/red]")
         return
 
-    # --- OUTPUT SELECTION ---
     output_root = Path(cd) / "output"
     existing_projects = []
     if output_root.exists():
@@ -929,7 +852,6 @@ def main():
     for fname in files_to_process:
         filename_only = os.path.basename(fname)
         
-        # Create a Tree for this file
         file_tree = Tree(f"[bold cyan]{filename_only}[/bold cyan]")
         
         with console.status(f"[bold green]Processing {filename_only}...[/bold green]"):
@@ -946,7 +868,6 @@ def main():
             else:
                 file_tree.label = f"[bold green]{filename_only} (Generated)[/bold green]"
 
-            # group logs
             for entry in logs:
                 name = entry['name']
                 status = entry['status']
@@ -960,7 +881,7 @@ def main():
                     file_tree.add(f"[red]❌ {name} (Error)[/red]: {msg}")
         
         console.print(file_tree)
-        console.print("") # Spacer
+        console.print("") 
 
     console.print(f"[bold]Output Folder:[/bold] {output_dir}")
 

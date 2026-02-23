@@ -553,7 +553,9 @@ def process_single_file(filepath, output_dir):
 
             shift_existing_images(ws, INSERT_START_ROW, total_insert_count)
             ws.insert_rows(INSERT_START_ROW, amount=total_insert_count)
-            write_rule_legend(ws, 1)
+            
+            # Align legend with the start of the Analysis Summary table
+            write_rule_legend(ws, INSERT_START_ROW) 
 
             # Updated Columns and Widths
             cols = ['A','B','C','D','E','F','G','H', 'I', 'J', 'K', 'L']

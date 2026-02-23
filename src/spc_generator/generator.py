@@ -7,7 +7,7 @@
   3. CALCULATES Analysis (Stats + Rules + Cpk)
   4. GENERATES PDF with SECTION BREAKS per Tab.
   
- Version: 4.8.0 (Added dynamic Nominal handling from limits)
+ Version: 4.8.1 (Ultra-resilient limits and missing Nominal extraction)
 """
 
 # --- IMPORTS ---
@@ -48,7 +48,7 @@ from rich import box
 console = Console()
 
 # --- CONSTANTS ---
-TOOL_VERSION = "4.8.0"
+TOOL_VERSION = "4.8.1"
 INPUT_PREFIX = "SPC_"        
 INSERT_START_ROW = 8   
 HEADER_SEARCH_ROWS = 7 # How many rows to scan for Part/Batch info
@@ -484,11 +484,65 @@ def process_single_file(filepath, output_dir):
             
             for col in feature_cols:
                 try:
-                    # Safely handle missing or blank Nominal entries
-                    nom_val = df_raw.loc[idx_nom, col] if idx_nom is not None else None
-                    has_nom = pd.notna(nom_val) and str(nom_val).strip() != ""
-                    nom_val_float = float(nom_val) if has_nom else None
+                    # 1. Safely Extract Nominal (Ignore string placeholders like "-" or "N/A")
+                    nom_val_float = None
+                    if idx_nom is not None:
+                        nom_raw = df_raw.loc[idx_nom, col]
+                        if pd.notna(nom_raw):
+                            nom_str = str(nom_raw).strip().upper()
+                            if nom_str not in ["", "NAN", "NULL", "NONE", "N/A", "-"]:
+                                try:
+                                    nom_val_float = float(nom_raw)
+                                except Exception:
+                                    pass # Could not parse, treat as missing
                     
+                    has_nom = (nom_val_float is not None)
+
+                    # 2. Extract Limits Safely
+                    usl_val, lsl_val = None, None
+                    
+                    if has_limits:
+                        raw_usl = df_raw.loc[idx_usl, col]
+                        raw_lsl = df_raw.loc[idx_lsl, col]
+                        
+                        if pd.notna(raw_usl) and pd.notna(raw_lsl):
+                            u_str = str(raw_usl).strip().upper()
+                            l_str = str(raw_lsl).strip().upper()
+                            if u_str not in ["", "NAN", "-", "N/A"] and l_str not in ["", "NAN", "-", "N/A"]:
+                                try:
+                                    usl_val = float(raw_usl)
+                                    lsl_val = float(raw_lsl)
+                                except Exception:
+                                    pass
+
+                    # 3. Extract Limits via Tolerances (if absolute limits missing)
+                    if (usl_val is None or lsl_val is None) and has_tols and has_nom:
+                        raw_ut = df_raw.loc[idx_ut, col]
+                        raw_lt = df_raw.loc[idx_lt, col]
+                        if pd.notna(raw_ut) and pd.notna(raw_lt):
+                            ut_str = str(raw_ut).strip().upper()
+                            lt_str = str(raw_lt).strip().upper()
+                            if ut_str not in ["", "NAN", "-", "N/A"] and lt_str not in ["", "NAN", "-", "N/A"]:
+                                try:
+                                    usl_val = nom_val_float + abs(float(raw_ut))
+                                    lsl_val = nom_val_float - abs(float(raw_lt))
+                                except Exception:
+                                    pass
+
+                    # 4. Final Verification
+                    if usl_val is None or lsl_val is None:
+                        continue # MUST skip this feature; no limits available
+                        
+                    # 5. Missing Nominal Midpoint Fallback
+                    if not has_nom:
+                        nom_val_float = (usl_val + lsl_val) / 2.0
+
+                    # Safety check for identical limits
+                    if usl_val == lsl_val:
+                        usl_val += 0.0001
+                        lsl_val -= 0.0001
+
+                    # 6. Extract Sample Data
                     sample_idxs = [x for x in df_raw.index if x not in metadata_keys]
                     subset_indices = df_raw.loc[sample_idxs].index.tolist()
                     subset_values = df_raw.loc[sample_idxs, col].tolist()
@@ -503,47 +557,11 @@ def process_single_file(filepath, output_dir):
                             continue
                         try:
                             num = float(val)
-                            if not np.isnan(num): clean_samples.append(num)
-                        except: pass
-                    
-                    # --- NEW LOGIC: DETERMINE LIMITS ---
-                    usl_val, lsl_val = None, None
-
-                    # 1. Try Absolute Limits first
-                    if has_limits:
-                        try:
-                            raw_usl = df_raw.loc[idx_usl, col]
-                            raw_lsl = df_raw.loc[idx_lsl, col]
-                            if pd.notna(raw_usl) and str(raw_usl).strip() != "" and pd.notna(raw_lsl) and str(raw_lsl).strip() != "":
-                                usl_val = float(raw_usl)
-                                lsl_val = float(raw_lsl)
-                        except: pass
-                    
-                    # 2. If no valid limits yet, try Tolerances
-                    # (Note: Tolerances REQUIRE a base Nominal value to function)
-                    if (usl_val is None or lsl_val is None) and has_tols and has_nom:
-                        try:
-                            raw_ut = df_raw.loc[idx_ut, col]
-                            raw_lt = df_raw.loc[idx_lt, col]
-                            if pd.notna(raw_ut) and pd.notna(raw_lt):
-                                # Logic: USL = Nom + UpperTol, LSL = Nom - |LowerTol|
-                                usl_val = nom_val_float + abs(float(raw_ut))
-                                lsl_val = nom_val_float - abs(float(raw_lt))
-                        except: pass
-                    
-                    # 3. Final Check
-                    if usl_val is None or lsl_val is None:
-                        continue # Skip feature if no limits can be determined
-
-                    # 4. Handle Missing Nominal (Compute Midpoint)
-                    if not has_nom:
-                        nom_val_float = (usl_val + lsl_val) / 2.0
-
-                    # Fallback/Safety: If Limits end up identical
-                    if usl_val == lsl_val:
-                        usl_val += 0.0001
-                        lsl_val -= 0.0001
-
+                            if not np.isnan(num): 
+                                clean_samples.append(num)
+                        except Exception: 
+                            pass
+                            
                     cp, cpk, mean_val, sigma_val = calculate_cpk(np.array(clean_samples), usl_val, lsl_val)
                     
                     features_data.append({
@@ -556,7 +574,8 @@ def process_single_file(filepath, output_dir):
                     
                     pdf_summary_data.append([sheet_name, col, f"{cpk:.2f}", "PASS" if cpk >= 1.33 else "FAIL"])
 
-                except: continue
+                except Exception: 
+                    continue
             
             if not features_data: 
                 tab_log.append({

@@ -556,16 +556,16 @@ def process_single_file(filepath, output_dir):
             ws.insert_rows(INSERT_START_ROW, amount=total_insert_count)
             write_rule_legend(ws, 1)
 
-            cols = ['A','B','C','D','E','F','G','H', 'I', 'J']
-            widths = [25, 15, 15, 15, 15, 15, 30, 20, 15, 15]
+            cols = ['A','B','C','D','E','F','G','H', 'I', 'J', 'K', 'L']
+            widths = [25, 15, 15, 15, 15, 15, 30, 20, 15, 15, 15, 15]
             for l, w in zip(cols, widths): ws.column_dimensions[l].width = w
-            
+
             r = INSERT_START_ROW
             ws.cell(r,1,"ANALYSIS SUMMARY").font = Font(bold=True, size=14, color="FFFFFF")
             ws.cell(r,1).fill = PatternFill(start_color=COLOR_PURPLE_DARK, end_color=COLOR_PURPLE_DARK, fill_type="solid")
             r += 1
-            
-            headers = ["Feature", "Nominal", "USL (Calc)", "LSL (Calc)", "Mean", "StdDev", "Pattern / Status", "OOT Points", "Dev. Tol (+)", "Dev. Tol (-)"]
+
+            headers = ["Feature", "Nominal", "USL (Calc)", "LSL (Calc)", "Mean", "StdDev", "Pattern / Status", "OOT Points", "Dev. Tol (+)", "Dev. Tol (-)", "Dev. USL", "Dev. LSL"]
             for i, h in enumerate(headers, 1): style_header_cell(ws.cell(r, i, h))
             
             f_pass, font_p = PatternFill(start_color="C6EFCE", fill_type="solid"), Font(color="006100", bold=True)
@@ -586,21 +586,27 @@ def process_single_file(filepath, output_dir):
 
                 dev_tol_minus = ""
                 dev_tol_plus = ""
-                
+                dev_usl = ""
+                dev_lsl = ""
+
                 if has_data:
                     data_min = np.min(data)
                     data_max = np.max(data)
-                    if data_min < feat['lsl']: dev_tol_minus = feat['nominal'] - data_min
-                    if data_max > feat['usl']: dev_tol_plus = data_max - feat['nominal']
+                    if data_min < feat['lsl']: 
+                        dev_tol_minus = feat['nominal'] - data_min
+                        dev_lsl = feat['lsl'] - data_min
+                    if data_max > feat['usl']: 
+                        dev_tol_plus = data_max - feat['nominal']
+                        dev_usl = data_max - feat['usl']
 
                 row_vals = [
                     str(feat['name']), feat['nominal_disp'], feat['usl'], feat['lsl'], 
-                    mean, std_dev, status, oot_disp, dev_tol_plus, dev_tol_minus
+                    mean, std_dev, status, oot_disp, dev_tol_plus, dev_tol_minus, dev_usl, dev_lsl
                 ]
-                
+
                 for c_idx, val in enumerate(row_vals, 1):
                     cell = ws.cell(r, c_idx, val)
-                    is_num_col = (has_data and c_idx in [2,3,4,5,6,9,10] and isinstance(val, (int, float)))
+                    is_num_col = (has_data and c_idx in [2,3,4,5,6,9,10,11,12] and isinstance(val, (int, float)))
                     style_data_cell(cell, is_nominal=(c_idx==2), is_numeric=is_num_col)
                     
                     if c_idx == 5 and has_data:

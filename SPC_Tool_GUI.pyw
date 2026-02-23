@@ -279,9 +279,9 @@ class SPCInterface:
         self.refresh_project_list()
         
         if error_count == 0:
-            messagebox.showinfo("Complete", f"Processing complete!\nFiles saved to:\n{output_loc}")
+            self.log(f"Processing complete! Files saved to: {output_loc}", "green")
         else:
-            messagebox.showwarning("Complete", f"Processing finished with {error_count} errors.\nCheck the log for details.")
+            self.log(f"Processing finished with {error_count} errors. Please review the log above.", "orange")
 
 if __name__ == "__main__":
     root = tk.Tk()
